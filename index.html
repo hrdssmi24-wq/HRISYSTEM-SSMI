@@ -1,0 +1,2384 @@
+import React, { useState, useMemo, useRef, useEffect, useCallback } from "react";
+import {
+  LayoutDashboard, Users, UserMinus, CalendarCheck, FileSignature, Inbox as InboxIcon,
+  LogOut, Search, Plus, X, Check, MapPin, Printer, Pencil, Shield,
+  UserCog, CalendarClock, ChevronRight, AlertTriangle, Eraser, Crosshair, Clock, Filter,
+  PenLine, FileDown, Loader2, CalendarPlus, RotateCcw, CloudUpload,
+} from "lucide-react";
+import {
+  BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, PieChart, Pie, Cell, CartesianGrid,
+} from "recharts";
+
+/* ============================================================================
+   KONSTANTA & UTILITAS
+   ========================================================================== */
+
+const TODAY = new Date(2026, 8, 15); // 15 September 2026 (tanggal simulasi)
+
+const DEPARTEMEN = ["BOD", "Sales and Marketing", "Quality Control", "Production", "HRGA", "Warehouse"];
+const EMP_STATUS = ["Supporting", "PKWTT", "PKWT", "Internship"];
+const SOURCE_CONTRACT = ["Supporting", "SSMI", "Grahabuana", "GSP"];
+const KAWIN = ["TK/0", "TK/1", "TK/2", "TK/3", "K/0", "K/1", "K/2", "K/3"];
+const PENDIDIKAN = ["SD", "SMP", "SMA/SMK", "D3", "S1", "S2"];
+const LEVEL = ["Operator", "Staff", "Foreman", "Supervisor", "Manager", "Director"];
+const BULAN = ["Januari", "Februari", "Maret", "April", "Mei", "Juni", "Juli", "Agustus", "September", "Oktober", "November", "Desember"];
+const KODE_ABSEN = {
+  H: { label: "Hadir", warna: "bg-emerald-100 text-emerald-800" },
+  S: { label: "Sakit", warna: "bg-rose-100 text-rose-800" },
+  C: { label: "Cuti", warna: "bg-sky-100 text-sky-800" },
+  I: { label: "Izin", warna: "bg-amber-100 text-amber-900" },
+  M: { label: "Mangkir", warna: "bg-red-600 text-white" },
+  "H/TLK": { label: "Tugas Luar Kota", warna: "bg-teal-700 text-white" },
+};
+
+const pad = (n) => String(n).padStart(2, "0");
+const iso = (d) => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+const parse = (s) => { const [y, m, d] = s.split("-").map(Number); return new Date(y, m - 1, d); };
+const tglPanjang = (s) => { if (!s) return "—"; const d = parse(s); return `${d.getDate()} ${BULAN[d.getMonth()]} ${d.getFullYear()}`; };
+const tglPendek = (s) => { if (!s) return "—"; const d = parse(s); return `${pad(d.getDate())}/${pad(d.getMonth() + 1)}/${d.getFullYear()}`; };
+
+function hitungUsia(tglLahir, ref = TODAY) {
+  if (!tglLahir) return null;
+  const l = parse(tglLahir);
+  let u = ref.getFullYear() - l.getFullYear();
+  const m = ref.getMonth() - l.getMonth();
+  if (m < 0 || (m === 0 && ref.getDate() < l.getDate())) u--;
+  return u;
+}
+
+function sisaHariKontrak(tglExpired, ref = TODAY) {
+  if (!tglExpired) return null;
+  return Math.ceil((parse(tglExpired) - ref) / 86400000);
+}
+
+/** Periode absensi: tanggal 11 bulan berjalan s.d. tanggal 10 bulan berikutnya. */
+function periodeDari(ref = TODAY) {
+  const d = new Date(ref);
+  const mulai = d.getDate() >= 11
+    ? new Date(d.getFullYear(), d.getMonth(), 11)
+    : new Date(d.getFullYear(), d.getMonth() - 1, 11);
+  const akhir = new Date(mulai.getFullYear(), mulai.getMonth() + 1, 10);
+  return { mulai, akhir, kunci: iso(mulai) };
+}
+
+function hariDalamPeriode(p) {
+  const out = [];
+  for (let d = new Date(p.mulai); d <= p.akhir; d.setDate(d.getDate() + 1)) out.push(new Date(d));
+  return out;
+}
+
+const labelPeriode = (p) =>
+  `11 ${BULAN[p.mulai.getMonth()].slice(0, 3)} ${p.mulai.getFullYear()} – 10 ${BULAN[p.akhir.getMonth()].slice(0, 3)} ${p.akhir.getFullYear()}`;
+
+/** Jarak dua koordinat dalam meter (haversine). */
+function jarakMeter(lat1, lon1, lat2, lon2) {
+  const R = 6371000, rad = (x) => (x * Math.PI) / 180;
+  const dLat = rad(lat2 - lat1), dLon = rad(lon2 - lon1);
+  const a = Math.sin(dLat / 2) ** 2 + Math.cos(rad(lat1)) * Math.cos(rad(lat2)) * Math.sin(dLon / 2) ** 2;
+  return Math.round(2 * R * Math.asin(Math.sqrt(a)));
+}
+
+const inisial = (nama) => nama.split(" ").slice(0, 2).map((w) => w[0]).join("").toUpperCase();
+const uid = () => Math.random().toString(36).slice(2, 10);
+
+/* --------------------------- Penyimpanan permanen ------------------------- */
+/** Seluruh basis data disimpan pada satu kunci agar penulisan tetap atomik. */
+const KUNCI_DB = "hris:ssmi:v1";
+
+async function muatDB() {
+  try {
+    const hasil = await window.storage.get(KUNCI_DB);
+    if (!hasil?.value) return null;
+    return typeof hasil.value === "string" ? JSON.parse(hasil.value) : hasil.value;
+  } catch {
+    return null; // kunci belum pernah ditulis
+  }
+}
+
+async function simpanDB(data) {
+  await window.storage.set(KUNCI_DB, JSON.stringify(data));
+}
+
+async function hapusDB() {
+  try { await window.storage.delete(KUNCI_DB); } catch { /* sudah kosong */ }
+}
+
+/** Aturan cetak global: hanya #area-cetak yang ikut tercetak. */
+function GayaCetak() {
+  return (
+    <style>{`@media print {
+      body * { visibility: hidden !important; }
+      #area-cetak, #area-cetak * { visibility: visible !important; }
+      #area-cetak { position: absolute !important; left: 0 !important; top: 0 !important;
+                    margin: 0 !important; box-shadow: none !important; }
+      .tanpa-cetak { display: none !important; }
+      .hanya-cetak { display: block !important; }
+    }`}</style>
+  );
+}
+
+/* ============================================================================
+   MOCK DATA
+   ========================================================================== */
+
+const KARYAWAN_AWAL = [
+  ["SSMI-0001", "Rahmat Hidayat", "L", "Bandung", "1979-03-14", "BOD", "Board", "Director", "PKWTT", "SSMI", "S2", "K/3", null, "2012-01-09"],
+  ["SSMI-0014", "Dwi Lestari", "P", "Semarang", "1988-07-02", "HRGA", "Human Resource", "Manager", "PKWTT", "SSMI", "S1", "K/2", null, "2015-03-02"],
+  ["SSMI-0027", "Bayu Saputra", "L", "Pemalang", "1993-11-21", "Production", "Assembly", "Supervisor", "PKWTT", "SSMI", "S1", "K/1", null, "2017-06-12"],
+  ["SSMI-0033", "Nur Aini", "P", "Tegal", "1996-05-30", "Quality Control", "Inspeksi", "Staff", "PKWT", "SSMI", "D3", "TK/0", "2026-11-30", "2024-12-01"],
+  ["SSMI-0041", "Agus Priyanto", "L", "Pekalongan", "1991-02-18", "Warehouse", "Gudang Bahan", "Foreman", "PKWT", "Grahabuana", "SMA/SMK", "K/2", "2026-10-05", "2024-10-06"],
+  ["SSMI-0052", "Siti Maemunah", "P", "Brebes", "1999-09-09", "Production", "Finishing", "Operator", "PKWT", "GSP", "SMA/SMK", "TK/0", "2027-02-28", "2025-03-01"],
+  ["SSMI-0058", "Joko Purnomo", "L", "Purwokerto", "1985-12-04", "Sales and Marketing", "Penjualan", "Manager", "PKWTT", "SSMI", "S1", "K/3", null, "2016-08-15"],
+  ["SSMI-0063", "Wulan Sari", "P", "Slawi", "2001-04-17", "Sales and Marketing", "Admin Penjualan", "Staff", "PKWT", "SSMI", "D3", "TK/0", "2026-09-28", "2025-09-29"],
+  ["SSMI-0071", "Hendra Wijaya", "L", "Cirebon", "1994-08-23", "Quality Control", "Kalibrasi", "Staff", "PKWTT", "SSMI", "S1", "K/0", null, "2019-02-04"],
+  ["SSMI-0080", "Fitri Handayani", "P", "Pemalang", "2003-01-12", "HRGA", "Umum", "Staff", "Internship", "Supporting", "SMA/SMK", "TK/0", "2026-12-31", "2026-07-01"],
+  ["SSMI-0084", "Slamet Riyadi", "L", "Batang", "1982-06-06", "Production", "Maintenance", "Foreman", "PKWTT", "SSMI", "SMA/SMK", "K/3", null, "2013-05-20"],
+  ["SSMI-0092", "Ratna Dewi", "P", "Kendal", "1997-10-28", "Warehouse", "Gudang Jadi", "Staff", "PKWT", "Grahabuana", "D3", "TK/1", "2027-01-15", "2025-01-16"],
+  ["SSMI-0097", "Yusuf Maulana", "L", "Pemalang", "2000-03-03", "Production", "Assembly", "Operator", "Supporting", "Supporting", "SMP", "TK/0", null, "2023-11-13"],
+  ["SSMI-0103", "Indah Permata", "P", "Solo", "1995-07-19", "Quality Control", "Inspeksi", "Supervisor", "PKWTT", "SSMI", "S1", "K/1", null, "2018-09-10"],
+];
+
+const karyawanAwal = KARYAWAN_AWAL.map(
+  ([npk, nama, jk, tempat, lahir, dept, section, level, empStatus, source, pendidikan, kawin, kontrakExp, masuk]) => ({
+    id: uid(), npk, nama, jenisKelamin: jk, tempatLahir: tempat, tanggalLahir: lahir,
+    departemen: dept, section, level, employmentStatus: empStatus, sourceContract: source,
+    pendidikan, statusKawin: kawin, kontrakExpired: kontrakExp, tanggalMasuk: masuk,
+    noKtp: "33" + Math.floor(1e12 + Math.random() * 8e12), noBpjsTk: "", noBpjsKes: "",
+    noTelepon: "0812" + Math.floor(1000000 + Math.random() * 8999999),
+    noTeleponDarurat: "0857" + Math.floor(1000000 + Math.random() * 8999999),
+    foto: null, status: "Active", inactiveDate: null, alasanInactive: null,
+    jatahCuti: 12, sisaCuti: [12, 10, 9, 7, 12, 6, 11, 8][Math.floor(Math.random() * 8)],
+  })
+);
+
+karyawanAwal.push({
+  id: uid(), npk: "SSMI-0019", nama: "Teguh Santoso", jenisKelamin: "L", tempatLahir: "Tegal",
+  tanggalLahir: "1990-02-11", departemen: "Production", section: "Finishing", level: "Operator",
+  employmentStatus: "PKWT", sourceContract: "GSP", pendidikan: "SMA/SMK", statusKawin: "K/1",
+  kontrakExpired: "2026-08-31", tanggalMasuk: "2024-09-01", noKtp: "3327081990000012",
+  noBpjsTk: "", noBpjsKes: "", noTelepon: "081200000019", noTeleponDarurat: "085700000019",
+  foto: null, status: "Inactive", inactiveDate: "2026-08-31",
+  alasanInactive: "Kontrak berakhir, tidak diperpanjang", jatahCuti: 12, sisaCuti: 0,
+});
+
+const AKUN_AWAL = [
+  { id: uid(), email: "sAdmin@ssmi.com", password: "123456798", nama: "Super Admin SSMI", role: "superadmin", npk: null, ttd: null },
+  { id: uid(), email: "Admin@ssmi.com", password: "123456798", nama: "Admin HRGA", role: "admin", npk: "SSMI-0014", ttd: null },
+  { id: uid(), email: "bayu@ssmi.com", password: "123456", nama: "Bayu Saputra", role: "user", npk: "SSMI-0027", ttd: null },
+];
+
+const GEOFENCE_AWAL = {
+  nama: "Plant Pemalang", latitude: -6.8898, longitude: 109.3794, radius: 150,
+};
+
+function absensiAwal(karyawan) {
+  const p = periodeDari();
+  const rec = {};
+  karyawan.filter((k) => k.status === "Active").forEach((k) => {
+    rec[k.npk] = {};
+    hariDalamPeriode(p).forEach((d) => {
+      if (d > TODAY) return;
+      if (d.getDay() === 0) return;
+      const r = Math.random();
+      rec[k.npk][iso(d)] = r > 0.93 ? (r > 0.98 ? "M" : "S") : "H";
+    });
+  });
+  return { [p.kunci]: rec };
+}
+
+const IZIN_AWAL = (karyawan) => [
+  {
+    id: uid(), npk: "SSMI-0052", nama: "Siti Maemunah", departemen: "Production", kategori: "Cuti",
+    tglMulai: "2026-09-21", tglSelesai: "2026-09-22", jumlahHari: 2, alasan: "Acara keluarga di luar kota",
+    status: "Menunggu Admin", ttdUser: "ada", ttdAdmin: null, ttdSuper: null,
+    namaAdmin: null, namaSuper: null,
+    riwayat: [{ oleh: "Siti Maemunah", aksi: "Mengajukan", tgl: "2026-09-14" }],
+  },
+  {
+    id: uid(), npk: "SSMI-0041", nama: "Agus Priyanto", departemen: "Warehouse", kategori: "Tugas Luar Kota",
+    tglMulai: "2026-09-17", tglSelesai: "2026-09-18", jumlahHari: 2, alasan: "Pendampingan pengiriman ke Surabaya",
+    status: "Menunggu Super Admin", ttdUser: "ada", ttdAdmin: "ada", ttdSuper: null,
+    namaAdmin: "Admin HRGA", namaSuper: null,
+    riwayat: [
+      { oleh: "Agus Priyanto", aksi: "Mengajukan", tgl: "2026-09-12" },
+      { oleh: "Admin HRGA", aksi: "Diteruskan ke Super Admin", tgl: "2026-09-13" },
+    ],
+  },
+  {
+    id: uid(), npk: "SSMI-0027", nama: "Bayu Saputra", departemen: "Production", kategori: "Izin",
+    tglMulai: "2026-09-08", tglSelesai: "2026-09-08", jumlahHari: 1, alasan: "Mengurus dokumen kependudukan",
+    status: "Disetujui", ttdUser: "ada", ttdAdmin: "ada", ttdSuper: "ada",
+    namaAdmin: "Admin HRGA", namaSuper: "Super Admin SSMI",
+    riwayat: [
+      { oleh: "Bayu Saputra", aksi: "Mengajukan", tgl: "2026-09-05" },
+      { oleh: "Admin HRGA", aksi: "Diteruskan ke Super Admin", tgl: "2026-09-06" },
+      { oleh: "Super Admin SSMI", aksi: "Disetujui", tgl: "2026-09-07" },
+    ],
+  },
+];
+
+/* ============================================================================
+   KOMPONEN DASAR
+   ========================================================================== */
+
+function Avatar({ nama, foto, size = 40 }) {
+  return foto ? (
+    <img src={foto} alt={nama} style={{ width: size, height: size }} className="rounded object-cover" />
+  ) : (
+    <div
+      style={{ width: size, height: size, fontSize: size * 0.36 }}
+      className="rounded bg-teal-800 text-teal-50 flex items-center justify-center font-semibold tracking-tight shrink-0"
+    >
+      {inisial(nama || "?")}
+    </div>
+  );
+}
+
+function Modal({ open, onClose, title, children, lebar = "max-w-3xl" }) {
+  if (!open) return null;
+  return (
+    <div className="fixed inset-0 z-50 flex items-start justify-center overflow-y-auto bg-slate-900/60 p-4 sm:p-8">
+      <div className={`w-full ${lebar} rounded bg-white shadow-xl`}>
+        <div className="flex items-center justify-between border-b border-stone-200 px-5 py-3">
+          <h3 className="text-base font-semibold text-slate-900">{title}</h3>
+          <button onClick={onClose} className="rounded p-1 text-slate-500 hover:bg-stone-100 focus:outline-none focus:ring-2 focus:ring-teal-700" aria-label="Tutup">
+            <X size={18} />
+          </button>
+        </div>
+        <div className="px-5 py-4">{children}</div>
+      </div>
+    </div>
+  );
+}
+
+function Field({ label, children, hint, wajib }) {
+  return (
+    <label className="block">
+      <span className="mb-1 block text-xs font-medium text-slate-600">
+        {label} {wajib && <span className="text-red-600">*</span>}
+      </span>
+      {children}
+      {hint && <span className="mt-1 block text-xs text-slate-400">{hint}</span>}
+    </label>
+  );
+}
+
+const inputCls =
+  "w-full rounded border border-stone-300 bg-white px-3 py-2 text-sm text-slate-900 placeholder-slate-400 focus:border-teal-700 focus:outline-none focus:ring-1 focus:ring-teal-700 disabled:bg-stone-100 disabled:text-slate-500";
+
+function Tombol({ children, onClick, varian = "utama", ikon: Ikon, kecil, disabled, type = "button" }) {
+  const base = "inline-flex items-center gap-2 rounded font-medium transition-colors focus:outline-none focus:ring-2 focus:ring-offset-1 disabled:opacity-40 disabled:cursor-not-allowed";
+  const ukuran = kecil ? "px-2.5 py-1.5 text-xs" : "px-4 py-2 text-sm";
+  const gaya = {
+    utama: "bg-teal-800 text-white hover:bg-teal-900 focus:ring-teal-700",
+    aksi: "bg-amber-400 text-slate-900 hover:bg-amber-300 focus:ring-amber-500",
+    garis: "border border-stone-300 bg-white text-slate-700 hover:bg-stone-100 focus:ring-slate-400",
+    bahaya: "bg-red-700 text-white hover:bg-red-800 focus:ring-red-600",
+    sunyi: "text-slate-600 hover:bg-stone-100 focus:ring-slate-400",
+  }[varian];
+  return (
+    <button type={type} onClick={onClick} disabled={disabled} className={`${base} ${ukuran} ${gaya}`}>
+      {Ikon && <Ikon size={kecil ? 14 : 16} />} {children}
+    </button>
+  );
+}
+
+function Lencana({ children, warna = "bg-stone-200 text-slate-700" }) {
+  return <span className={`inline-block rounded px-2 py-0.5 text-xs font-medium ${warna}`}>{children}</span>;
+}
+
+function lencanaStatus(s) {
+  return {
+    "Menunggu Admin": "bg-amber-100 text-amber-900",
+    "Menunggu Super Admin": "bg-sky-100 text-sky-900",
+    Disetujui: "bg-emerald-100 text-emerald-800",
+    Ditolak: "bg-red-100 text-red-800",
+  }[s] || "bg-stone-200 text-slate-700";
+}
+
+function Kosong({ pesan, aksi }) {
+  return (
+    <div className="flex flex-col items-center gap-3 border border-dashed border-stone-300 bg-white px-6 py-12 text-center">
+      <p className="text-sm text-slate-500">{pesan}</p>
+      {aksi}
+    </div>
+  );
+}
+
+/* ---------------------------- Tanda tangan digital ------------------------ */
+
+function TandaTangan({ nilai, onChange, nama, terkunci }) {
+  const canvasRef = useRef(null);
+  const gambar = useRef(false);
+  const [adaGoresan, setAdaGoresan] = useState(Boolean(nilai));
+
+  const ctx = () => canvasRef.current.getContext("2d");
+
+  useEffect(() => {
+    const c = canvasRef.current;
+    if (!c) return;
+    const g = c.getContext("2d");
+    g.lineWidth = 2.2; g.lineCap = "round"; g.lineJoin = "round"; g.strokeStyle = "#0f172a";
+    if (nilai && nilai.startsWith("data:")) {
+      const img = new Image();
+      img.onload = () => g.drawImage(img, 0, 0, c.width, c.height);
+      img.src = nilai;
+    }
+  }, []); // eslint-disable-line
+
+  const titik = (e) => {
+    const r = canvasRef.current.getBoundingClientRect();
+    return {
+      x: ((e.clientX - r.left) / r.width) * canvasRef.current.width,
+      y: ((e.clientY - r.top) / r.height) * canvasRef.current.height,
+    };
+  };
+
+  const mulai = (e) => {
+    if (terkunci) return;
+    e.preventDefault();
+    gambar.current = true;
+    const { x, y } = titik(e);
+    ctx().beginPath(); ctx().moveTo(x, y);
+    canvasRef.current.setPointerCapture(e.pointerId);
+  };
+  const gerak = (e) => {
+    if (!gambar.current) return;
+    const { x, y } = titik(e);
+    ctx().lineTo(x, y); ctx().stroke();
+    setAdaGoresan(true);
+  };
+  const selesai = () => {
+    if (!gambar.current) return;
+    gambar.current = false;
+    onChange?.(canvasRef.current.toDataURL("image/png"));
+  };
+  const hapus = () => {
+    const c = canvasRef.current;
+    ctx().clearRect(0, 0, c.width, c.height);
+    setAdaGoresan(false);
+    onChange?.(null);
+  };
+
+  return (
+    <div>
+      <div className="relative border border-stone-300 bg-white">
+        <canvas
+          ref={canvasRef}
+          width={520}
+          height={170}
+          onPointerDown={mulai}
+          onPointerMove={gerak}
+          onPointerUp={selesai}
+          onPointerLeave={selesai}
+          className={`h-32 w-full touch-none ${terkunci ? "cursor-default" : "cursor-crosshair"}`}
+        />
+        {!adaGoresan && (
+          <span className="pointer-events-none absolute inset-0 flex items-center justify-center text-xs text-slate-400">
+            {terkunci ? "Belum ditandatangani" : "Tanda tangan di area ini"}
+          </span>
+        )}
+      </div>
+      <div className="mt-1 flex items-center justify-between">
+        <span className="text-xs text-slate-500">{nama}</span>
+        {!terkunci && (
+          <button onClick={hapus} className="inline-flex items-center gap-1 text-xs text-slate-500 hover:text-red-700">
+            <Eraser size={12} /> Hapus
+          </button>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function TtdTersimpan({ nilai, nama, peran }) {
+  return (
+    <div className="text-center">
+      <div className="flex h-24 items-end justify-center border-b border-slate-900">
+        {nilai && nilai.startsWith("data:") ? (
+          <img src={nilai} alt={`Tanda tangan ${nama}`} className="max-h-24 object-contain" />
+        ) : nilai ? (
+          <span className="pb-1 font-serif text-lg italic text-slate-800">{nama}</span>
+        ) : (
+          <span className="pb-2 text-xs text-slate-300">belum ditandatangani</span>
+        )}
+      </div>
+      <p className="mt-1 text-xs font-medium text-slate-800">{nama || "—"}</p>
+      <p className="text-xs text-slate-500">{peran}</p>
+    </div>
+  );
+}
+
+/* ============================================================================
+   LOGIN
+   ========================================================================== */
+
+function Login({ akun, onMasuk }) {
+  const [email, setEmail] = useState("");
+  const [sandi, setSandi] = useState("");
+  const [galat, setGalat] = useState("");
+
+  const kirim = () => {
+    const a = akun.find(
+      (x) => x.email.toLowerCase() === email.trim().toLowerCase() && x.password === sandi
+    );
+    if (!a) return setGalat("Email atau kata sandi tidak cocok. Periksa kembali dan coba lagi.");
+    setGalat(""); onMasuk(a);
+  };
+
+  const isiCepat = (e, p) => { setEmail(e); setSandi(p); setGalat(""); };
+
+  return (
+    <div className="flex min-h-screen bg-slate-900">
+      <div className="hidden w-1/2 flex-col justify-between bg-teal-900 p-12 text-teal-50 lg:flex">
+        <div className="flex items-center gap-3">
+          <div className="flex h-10 w-10 items-center justify-center bg-amber-400 font-bold text-slate-900">S</div>
+          <span className="text-sm tracking-wide">PT Sinar Sejahtera Mandiri Indonesia</span>
+        </div>
+        <div>
+          <h1 className="max-w-md text-5xl font-semibold leading-tight">
+            Satu tempat untuk data orang, absensi, dan perizinan pabrik.
+          </h1>
+          <p className="mt-6 max-w-sm text-sm leading-relaxed text-teal-200">
+            Absensi terikat titik lokasi plant, perizinan bertanda tangan digital berjenjang, dan
+            rekap periode 11–10 yang tersusun sendiri.
+          </p>
+        </div>
+        <div className="grid grid-cols-3 gap-6 border-t border-teal-800 pt-6 text-sm">
+          <div><p className="text-2xl font-semibold tabular-nums">15</p><p className="text-teal-300">karyawan aktif</p></div>
+          <div><p className="text-2xl font-semibold tabular-nums">6</p><p className="text-teal-300">departemen</p></div>
+          <div><p className="text-2xl font-semibold tabular-nums">150 m</p><p className="text-teal-300">radius absen</p></div>
+        </div>
+      </div>
+
+      <div className="flex w-full items-center justify-center p-6 lg:w-1/2">
+        <div className="w-full max-w-sm">
+          <h2 className="text-2xl font-semibold text-white">Masuk ke HRIS</h2>
+          <p className="mt-1 text-sm text-slate-400">Gunakan akun kantor yang diberikan HRGA.</p>
+
+          <div className="mt-8 space-y-4">
+            <div>
+              <span className="mb-1 block text-xs font-medium text-slate-300">Email</span>
+              <input value={email} onChange={(e) => setEmail(e.target.value)} placeholder="nama@ssmi.com"
+                className="w-full rounded border border-slate-700 bg-slate-800 px-3 py-2 text-sm text-white placeholder-slate-500 focus:border-amber-400 focus:outline-none" />
+            </div>
+            <div>
+              <span className="mb-1 block text-xs font-medium text-slate-300">Kata sandi</span>
+              <input type="password" value={sandi} onChange={(e) => setSandi(e.target.value)}
+                onKeyDown={(e) => e.key === "Enter" && kirim()} placeholder="••••••••"
+                className="w-full rounded border border-slate-700 bg-slate-800 px-3 py-2 text-sm text-white placeholder-slate-500 focus:border-amber-400 focus:outline-none" />
+            </div>
+            {galat && (
+              <p className="flex items-start gap-2 rounded bg-red-950 px-3 py-2 text-xs text-red-200">
+                <AlertTriangle size={14} className="mt-0.5 shrink-0" /> {galat}
+              </p>
+            )}
+            <button onClick={kirim} className="w-full rounded bg-amber-400 py-2.5 text-sm font-semibold text-slate-900 hover:bg-amber-300 focus:outline-none focus:ring-2 focus:ring-amber-300 focus:ring-offset-2 focus:ring-offset-slate-900">
+              Masuk
+            </button>
+          </div>
+
+          <div className="mt-8 border-t border-slate-800 pt-4">
+            <p className="text-xs text-slate-500">Akun demo — klik untuk mengisi otomatis</p>
+            <div className="mt-2 space-y-1.5">
+              {[["Super Admin", "sAdmin@ssmi.com", "123456798"],
+                ["Admin", "Admin@ssmi.com", "123456798"],
+                ["Karyawan", "bayu@ssmi.com", "123456"]].map(([r, e, p]) => (
+                <button key={e} onClick={() => isiCepat(e, p)}
+                  className="flex w-full items-center justify-between rounded border border-slate-800 px-3 py-2 text-left text-xs text-slate-300 hover:border-amber-400 hover:text-white">
+                  <span className="font-medium">{r}</span>
+                  <span className="text-slate-500">{e}</span>
+                </button>
+              ))}
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ============================================================================
+   DASHBOARD
+   ========================================================================== */
+
+const WARNA = ["#0f766e", "#f59e0b", "#0369a1", "#65a30d", "#b45309", "#7c3aed", "#be123c"];
+
+function Dashboard({ karyawan }) {
+  const [bulan, setBulan] = useState(TODAY.getMonth());
+  const [tahun, setTahun] = useState(TODAY.getFullYear());
+  const [bukaLaporan, setBukaLaporan] = useState(false);
+
+  const { aktif, keluarPeriode, masukPeriode } = useMemo(() => {
+    const awal = new Date(tahun, bulan, 1);
+    const akhir = new Date(tahun, bulan + 1, 0);
+    const aktif = karyawan.filter((k) => {
+      if (parse(k.tanggalMasuk) > akhir) return false;
+      if (k.status === "Inactive" && k.inactiveDate && parse(k.inactiveDate) < awal) return false;
+      return true;
+    });
+    const keluarPeriode = karyawan.filter(
+      (k) => k.inactiveDate && parse(k.inactiveDate) >= awal && parse(k.inactiveDate) <= akhir
+    );
+    const masukPeriode = karyawan.filter(
+      (k) => parse(k.tanggalMasuk) >= awal && parse(k.tanggalMasuk) <= akhir
+    );
+    return { aktif, keluarPeriode, masukPeriode };
+  }, [karyawan, bulan, tahun]);
+
+  const hitung = (kunci, daftar) =>
+    daftar.map((v) => ({ nama: v, jumlah: aktif.filter((k) => k[kunci] === v).length }))
+      .filter((d) => d.jumlah > 0);
+
+  const gender = [
+    { nama: "Laki-laki", jumlah: aktif.filter((k) => k.jenisKelamin === "L").length },
+    { nama: "Perempuan", jumlah: aktif.filter((k) => k.jenisKelamin === "P").length },
+  ];
+  const perDept = hitung("departemen", DEPARTEMEN);
+  const perStatus = hitung("employmentStatus", EMP_STATUS);
+  const perLevel = hitung("level", LEVEL);
+  const perPendidikan = hitung("pendidikan", PENDIDIKAN);
+  const turnover = aktif.length ? ((keluarPeriode.length / aktif.length) * 100).toFixed(1) : "0.0";
+
+  const kontrakDekat = karyawan
+    .filter((k) => k.status === "Active" && k.kontrakExpired)
+    .map((k) => ({ ...k, sisa: sisaHariKontrak(k.kontrakExpired) }))
+    .filter((k) => k.sisa <= 60)
+    .sort((a, b) => a.sisa - b.sisa);
+
+  return (
+    <div className="space-y-5">
+      <div className="flex flex-wrap items-end justify-between gap-3">
+        <div>
+          <h1 className="text-2xl font-semibold text-slate-900">Ringkasan tenaga kerja</h1>
+          <p className="text-sm text-slate-500">Data per {BULAN[bulan]} {tahun}</p>
+        </div>
+        <div className="flex items-center gap-2">
+          <Filter size={15} className="text-slate-400" />
+          <select value={bulan} onChange={(e) => setBulan(Number(e.target.value))} className={`${inputCls} w-36 py-1.5`}>
+            {BULAN.map((b, i) => <option key={b} value={i}>{b}</option>)}
+          </select>
+          <select value={tahun} onChange={(e) => setTahun(Number(e.target.value))} className={`${inputCls} w-24 py-1.5`}>
+            {[2024, 2025, 2026].map((t) => <option key={t} value={t}>{t}</option>)}
+          </select>
+          <Tombol varian="garis" ikon={FileDown} onClick={() => setBukaLaporan(true)}>Unduh PDF</Tombol>
+        </div>
+      </div>
+
+      <div className="grid gap-px overflow-hidden rounded border border-stone-300 bg-stone-300 sm:grid-cols-2 lg:grid-cols-4">
+        {[
+          ["Karyawan aktif", aktif.filter((k) => k.status === "Active").length, "orang"],
+          ["Masuk bulan ini", masukPeriode.length, "orang"],
+          ["Keluar bulan ini", keluarPeriode.length, "orang"],
+          ["Turn over", turnover, "%"],
+        ].map(([judul, angka, satuan]) => (
+          <div key={judul} className="bg-white px-5 py-4">
+            <p className="text-xs text-slate-500">{judul}</p>
+            <p className="mt-1 text-3xl font-semibold tabular-nums text-slate-900">
+              {angka}<span className="ml-1 text-sm font-normal text-slate-400">{satuan}</span>
+            </p>
+          </div>
+        ))}
+      </div>
+
+      <div className="grid gap-4 lg:grid-cols-3">
+        <Panel judul="Komposisi jenis kelamin">
+          <ResponsiveContainer width="100%" height={220}>
+            <PieChart>
+              <Pie data={gender} dataKey="jumlah" nameKey="nama" innerRadius={45} outerRadius={80} paddingAngle={2}
+                label={(d) => `${d.nama} ${d.jumlah}`} labelLine={false} fontSize={11}>
+                {gender.map((_, i) => <Cell key={i} fill={i === 0 ? "#0f766e" : "#f59e0b"} />)}
+              </Pie>
+              <Tooltip />
+            </PieChart>
+          </ResponsiveContainer>
+        </Panel>
+
+        <Panel judul="Pendidikan terakhir" className="lg:col-span-1">
+          <ResponsiveContainer width="100%" height={220}>
+            <PieChart>
+              <Pie data={perPendidikan} dataKey="jumlah" nameKey="nama" outerRadius={82}
+                label={(d) => `${d.nama} ${((d.jumlah / (aktif.length || 1)) * 100).toFixed(0)}%`}
+                labelLine={false} fontSize={11}>
+                {perPendidikan.map((_, i) => <Cell key={i} fill={WARNA[i % WARNA.length]} />)}
+              </Pie>
+              <Tooltip />
+            </PieChart>
+          </ResponsiveContainer>
+        </Panel>
+
+        <Panel judul="Status kepegawaian">
+          <ResponsiveContainer width="100%" height={220}>
+            <BarChart data={perStatus} layout="vertical" margin={{ left: 12, right: 24 }}>
+              <CartesianGrid horizontal={false} stroke="#e7e5e4" />
+              <XAxis type="number" fontSize={11} allowDecimals={false} />
+              <YAxis type="category" dataKey="nama" width={78} fontSize={11} />
+              <Tooltip cursor={{ fill: "#f5f5f4" }} />
+              <Bar dataKey="jumlah" fill="#0f766e" barSize={18} />
+            </BarChart>
+          </ResponsiveContainer>
+        </Panel>
+
+        <Panel judul="Sebaran per departemen" className="lg:col-span-2">
+          <ResponsiveContainer width="100%" height={240}>
+            <BarChart data={perDept} margin={{ top: 8, right: 8 }}>
+              <CartesianGrid vertical={false} stroke="#e7e5e4" />
+              <XAxis dataKey="nama" fontSize={10} interval={0} angle={-12} textAnchor="end" height={54} />
+              <YAxis fontSize={11} allowDecimals={false} />
+              <Tooltip cursor={{ fill: "#f5f5f4" }} />
+              <Bar dataKey="jumlah" fill="#f59e0b" barSize={38} />
+            </BarChart>
+          </ResponsiveContainer>
+        </Panel>
+
+        <Panel judul="Sebaran per level">
+          <ResponsiveContainer width="100%" height={240}>
+            <BarChart data={perLevel} layout="vertical" margin={{ left: 12, right: 24 }}>
+              <CartesianGrid horizontal={false} stroke="#e7e5e4" />
+              <XAxis type="number" fontSize={11} allowDecimals={false} />
+              <YAxis type="category" dataKey="nama" width={78} fontSize={11} />
+              <Tooltip cursor={{ fill: "#f5f5f4" }} />
+              <Bar dataKey="jumlah" fill="#0369a1" barSize={16} />
+            </BarChart>
+          </ResponsiveContainer>
+        </Panel>
+      </div>
+
+      <Panel judul="Kontrak berakhir dalam 60 hari">
+        {kontrakDekat.length === 0 ? (
+          <p className="py-6 text-center text-sm text-slate-500">Tidak ada kontrak yang jatuh tempo dalam 60 hari.</p>
+        ) : (
+          <table className="w-full text-sm">
+            <thead>
+              <tr className="border-b border-stone-200 text-left text-xs text-slate-500">
+                <th className="py-2">Nama</th><th>NPK</th><th>Departemen</th><th>Berakhir</th><th className="text-right">Sisa hari</th>
+              </tr>
+            </thead>
+            <tbody>
+              {kontrakDekat.map((k) => (
+                <tr key={k.id} className="border-b border-stone-100 last:border-0">
+                  <td className="py-2 font-medium text-slate-800">{k.nama}</td>
+                  <td className="tabular-nums text-slate-600">{k.npk}</td>
+                  <td className="text-slate-600">{k.departemen}</td>
+                  <td className="text-slate-600">{tglPanjang(k.kontrakExpired)}</td>
+                  <td className="text-right">
+                    <Lencana warna={k.sisa <= 14 ? "bg-red-100 text-red-800" : "bg-amber-100 text-amber-900"}>
+                      {k.sisa} hari
+                    </Lencana>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
+      </Panel>
+
+      <Modal open={bukaLaporan} onClose={() => setBukaLaporan(false)} lebar="max-w-3xl"
+        title={`Laporan tenaga kerja — ${BULAN[bulan]} ${tahun}`}>
+        <div className="space-y-3">
+          <div className="max-h-[70vh] overflow-y-auto bg-stone-200 p-4">
+            <LaporanBulanan
+              bulan={bulan} tahun={tahun} aktif={aktif} masuk={masukPeriode} keluar={keluarPeriode}
+              gender={gender} perDept={perDept} perStatus={perStatus} perLevel={perLevel}
+              perPendidikan={perPendidikan} turnover={turnover} kontrakDekat={kontrakDekat}
+            />
+          </div>
+          <div className="flex items-center justify-between">
+            <p className="text-xs text-slate-500">
+              Pada dialog cetak, pilih tujuan “Simpan sebagai PDF” untuk mengunduh berkas.
+            </p>
+            <div className="flex gap-2">
+              <Tombol varian="garis" onClick={() => setBukaLaporan(false)}>Tutup</Tombol>
+              <Tombol ikon={Printer} onClick={() => window.print()}>Cetak / simpan PDF</Tombol>
+            </div>
+          </div>
+        </div>
+      </Modal>
+    </div>
+  );
+}
+
+/** Laporan bulanan siap cetak A4. */
+function LaporanBulanan({ bulan, tahun, aktif, masuk, keluar, gender, perDept, perStatus, perLevel, perPendidikan, turnover, kontrakDekat }) {
+  const jumlahAktif = aktif.filter((k) => k.status === "Active").length;
+  const persen = (n) => `${((n / (aktif.length || 1)) * 100).toFixed(1)}%`;
+
+  const Tabel = ({ judul, baris }) => (
+    <div>
+      <p className="mb-1 text-xs font-semibold text-slate-800">{judul}</p>
+      <table className="w-full border border-slate-300 text-xs">
+        <tbody>
+          {baris.map((b) => (
+            <tr key={b.nama} className="border-b border-slate-200 last:border-0">
+              <td className="px-2 py-1 text-slate-700">{b.nama}</td>
+              <td className="w-12 px-2 py-1 text-right tabular-nums">{b.jumlah}</td>
+              <td className="w-16 px-2 py-1 text-right tabular-nums text-slate-500">{persen(b.jumlah)}</td>
+            </tr>
+          ))}
+          {baris.length === 0 && <tr><td className="px-2 py-1 text-slate-400">Tidak ada data</td></tr>}
+        </tbody>
+      </table>
+    </div>
+  );
+
+  return (
+    <div id="area-cetak" className="mx-auto bg-white text-slate-900"
+      style={{ width: "210mm", minHeight: "297mm", padding: "15mm", fontSize: "10pt" }}>
+      <style>{`@media print { @page { size: A4 portrait; margin: 0; } }`}</style>
+
+      <header className="flex items-start justify-between border-b-2 border-slate-900 pb-2">
+        <div>
+          <p className="text-base font-bold leading-tight">PT SINAR SEJAHTERA MANDIRI INDONESIA</p>
+          <p className="text-xs text-slate-600">Laporan Tenaga Kerja · {BULAN[bulan]} {tahun}</p>
+        </div>
+        <div className="flex h-9 w-9 items-center justify-center bg-slate-900 text-lg font-bold text-white">S</div>
+      </header>
+
+      <div className="mt-4 grid grid-cols-4 gap-2">
+        {[["Karyawan aktif", jumlahAktif], ["Masuk", masuk.length], ["Keluar", keluar.length], ["Turn over", `${turnover}%`]]
+          .map(([l, v]) => (
+            <div key={l} className="border border-slate-300 px-3 py-2">
+              <p className="text-xs text-slate-600">{l}</p>
+              <p className="text-2xl font-semibold tabular-nums">{v}</p>
+            </div>
+          ))}
+      </div>
+
+      <div className="mt-4 grid grid-cols-2 gap-4">
+        <Tabel judul="Jenis kelamin" baris={gender} />
+        <Tabel judul="Status kepegawaian" baris={perStatus} />
+        <Tabel judul="Departemen" baris={perDept} />
+        <Tabel judul="Level" baris={perLevel} />
+        <Tabel judul="Pendidikan terakhir" baris={perPendidikan} />
+        <div>
+          <p className="mb-1 text-xs font-semibold text-slate-800">Kontrak jatuh tempo ≤ 60 hari</p>
+          <table className="w-full border border-slate-300 text-xs">
+            <tbody>
+              {kontrakDekat.map((k) => (
+                <tr key={k.id} className="border-b border-slate-200 last:border-0">
+                  <td className="px-2 py-1">{k.nama}</td>
+                  <td className="px-2 py-1 text-right tabular-nums">{tglPendek(k.kontrakExpired)}</td>
+                  <td className="w-16 px-2 py-1 text-right tabular-nums text-slate-500">{k.sisa} hr</td>
+                </tr>
+              ))}
+              {kontrakDekat.length === 0 && <tr><td className="px-2 py-1 text-slate-400">Tidak ada</td></tr>}
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      {keluar.length > 0 && (
+        <div className="mt-4">
+          <p className="mb-1 text-xs font-semibold text-slate-800">Karyawan keluar pada bulan ini</p>
+          <table className="w-full border border-slate-300 text-xs">
+            <thead className="bg-slate-100">
+              <tr><th className="px-2 py-1 text-left">Nama</th><th className="px-2 py-1 text-left">NPK</th>
+                <th className="px-2 py-1 text-left">Dept</th><th className="px-2 py-1 text-left">Tanggal</th>
+                <th className="px-2 py-1 text-left">Alasan</th></tr>
+            </thead>
+            <tbody>
+              {keluar.map((k) => (
+                <tr key={k.id} className="border-t border-slate-200">
+                  <td className="px-2 py-1">{k.nama}</td><td className="px-2 py-1 tabular-nums">{k.npk}</td>
+                  <td className="px-2 py-1">{k.departemen}</td>
+                  <td className="px-2 py-1 tabular-nums">{tglPendek(k.inactiveDate)}</td>
+                  <td className="px-2 py-1">{k.alasanInactive || "—"}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+
+      <footer className="mt-8 flex items-end justify-between border-t border-slate-300 pt-3 text-xs text-slate-500">
+        <span>Dicetak {tglPanjang(iso(TODAY))} dari HRIS SSMI</span>
+        <div className="text-center">
+          <div className="h-12" />
+          <p className="w-40 border-t border-slate-400 pt-1 text-slate-700">HRGA Manager</p>
+        </div>
+      </footer>
+    </div>
+  );
+}
+
+function Panel({ judul, children, className = "", aksi }) {
+  return (
+    <section className={`rounded border border-stone-300 bg-white ${className}`}>
+      <header className="flex items-center justify-between border-b border-stone-200 px-4 py-2.5">
+        <h2 className="text-sm font-semibold text-slate-800">{judul}</h2>
+        {aksi}
+      </header>
+      <div className="p-4">{children}</div>
+    </section>
+  );
+}
+
+/* ============================================================================
+   DATABASE KARYAWAN
+   ========================================================================== */
+
+function FormKaryawan({ awal, peran, onSimpan, onBatal }) {
+  const [f, setF] = useState(
+    awal || {
+      id: uid(), npk: "", nama: "", tempatLahir: "", tanggalLahir: "", jenisKelamin: "L",
+      noKtp: "", noBpjsTk: "", noBpjsKes: "", statusKawin: "TK/0", noTelepon: "",
+      noTeleponDarurat: "", pendidikan: "SMA/SMK", departemen: "Production", section: "",
+      level: "Operator", employmentStatus: "PKWT", sourceContract: "SSMI", kontrakExpired: "",
+      tanggalMasuk: iso(TODAY), status: "Active", foto: null, jatahCuti: 12, sisaCuti: 12,
+      inactiveDate: null, alasanInactive: null,
+    }
+  );
+  const set = (k) => (e) => setF({ ...f, [k]: e.target.value });
+  const bolehAdmin = peran === "admin" || peran === "superadmin";
+  const usia = hitungUsia(f.tanggalLahir);
+
+  const unggahFoto = (e) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    const r = new FileReader();
+    r.onload = () => setF((p) => ({ ...p, foto: r.result }));
+    r.readAsDataURL(file);
+  };
+
+  const simpan = () => {
+    if (!f.nama.trim() || !f.npk.trim()) return alert("Nama lengkap dan NPK wajib diisi.");
+    onSimpan(f);
+  };
+
+  return (
+    <div className="space-y-5">
+      <div className="flex items-center gap-4 border-b border-stone-200 pb-4">
+        <Avatar nama={f.nama || "?"} foto={f.foto} size={64} />
+        <div>
+          <label className="cursor-pointer text-sm font-medium text-teal-800 hover:underline">
+            Unggah foto profil
+            <input type="file" accept="image/*" onChange={unggahFoto} className="hidden" />
+          </label>
+          <p className="text-xs text-slate-500">JPG atau PNG, rasio persegi paling rapi.</p>
+        </div>
+      </div>
+
+      <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
+        <Field label="Nama lengkap" wajib><input value={f.nama} onChange={set("nama")} className={inputCls} /></Field>
+        <Field label="NPK" wajib><input value={f.npk} onChange={set("npk")} className={inputCls} placeholder="SSMI-0000" /></Field>
+        <Field label="Jenis kelamin">
+          <select value={f.jenisKelamin} onChange={set("jenisKelamin")} className={inputCls}>
+            <option value="L">Laki-laki</option><option value="P">Perempuan</option>
+          </select>
+        </Field>
+        <Field label="Tempat lahir"><input value={f.tempatLahir} onChange={set("tempatLahir")} className={inputCls} /></Field>
+        <Field label="Tanggal lahir"><input type="date" value={f.tanggalLahir || ""} onChange={set("tanggalLahir")} className={inputCls} /></Field>
+        <Field label="Usia" hint="Terhitung otomatis dari tanggal lahir">
+          <input value={usia == null ? "" : `${usia} tahun`} disabled className={inputCls} />
+        </Field>
+        <Field label="No. KTP"><input value={f.noKtp} onChange={set("noKtp")} className={inputCls} /></Field>
+        <Field label="No. BPJS Ketenagakerjaan" hint="Opsional"><input value={f.noBpjsTk} onChange={set("noBpjsTk")} className={inputCls} /></Field>
+        <Field label="No. BPJS Kesehatan" hint="Opsional"><input value={f.noBpjsKes} onChange={set("noBpjsKes")} className={inputCls} /></Field>
+        <Field label="Status perkawinan">
+          <select value={f.statusKawin} onChange={set("statusKawin")} className={inputCls}>
+            {KAWIN.map((k) => <option key={k}>{k}</option>)}
+          </select>
+        </Field>
+        <Field label="No. telepon"><input value={f.noTelepon} onChange={set("noTelepon")} className={inputCls} /></Field>
+        <Field label="No. telepon darurat"><input value={f.noTeleponDarurat} onChange={set("noTeleponDarurat")} className={inputCls} /></Field>
+        <Field label="Pendidikan terakhir">
+          <select value={f.pendidikan} onChange={set("pendidikan")} className={inputCls}>
+            {PENDIDIKAN.map((p) => <option key={p}>{p}</option>)}
+          </select>
+        </Field>
+        <Field label="Departemen">
+          <select value={f.departemen} onChange={set("departemen")} className={inputCls}>
+            {DEPARTEMEN.map((d) => <option key={d}>{d}</option>)}
+          </select>
+        </Field>
+        <Field label="Section" hint={bolehAdmin ? "Diisi HRGA" : "Hanya dapat diubah HRGA"}>
+          <input value={f.section} onChange={set("section")} disabled={!bolehAdmin} className={inputCls} />
+        </Field>
+        <Field label="Level" hint={bolehAdmin ? "Diisi HRGA" : "Hanya dapat diubah HRGA"}>
+          <select value={f.level} onChange={set("level")} disabled={!bolehAdmin} className={inputCls}>
+            {LEVEL.map((l) => <option key={l}>{l}</option>)}
+          </select>
+        </Field>
+        <Field label="Employment status">
+          <select value={f.employmentStatus} onChange={set("employmentStatus")} disabled={!bolehAdmin} className={inputCls}>
+            {EMP_STATUS.map((s) => <option key={s}>{s}</option>)}
+          </select>
+        </Field>
+        <Field label="Source contract">
+          <select value={f.sourceContract} onChange={set("sourceContract")} disabled={!bolehAdmin} className={inputCls}>
+            {SOURCE_CONTRACT.map((s) => <option key={s}>{s}</option>)}
+          </select>
+        </Field>
+        <Field label="Tanggal masuk"><input type="date" value={f.tanggalMasuk || ""} onChange={set("tanggalMasuk")} disabled={!bolehAdmin} className={inputCls} /></Field>
+        <Field label="Kontrak berakhir" hint="Khusus PKWT">
+          <input type="date" value={f.kontrakExpired || ""} onChange={set("kontrakExpired")}
+            disabled={!bolehAdmin || f.employmentStatus !== "PKWT"} className={inputCls} />
+        </Field>
+        <Field label="Sisa hari kontrak" hint="Terhitung otomatis">
+          <input disabled className={inputCls}
+            value={f.employmentStatus === "PKWT" && f.kontrakExpired ? `${sisaHariKontrak(f.kontrakExpired)} hari` : "—"} />
+        </Field>
+        <Field label="Status">
+          <select value={f.status} onChange={set("status")} disabled={!bolehAdmin} className={inputCls}>
+            <option>Active</option><option>Inactive</option>
+          </select>
+        </Field>
+        {f.status === "Inactive" && (
+          <Field label="Alasan nonaktif" wajib>
+            <input value={f.alasanInactive || ""} onChange={set("alasanInactive")} className={inputCls}
+              placeholder="Resign, kontrak berakhir, dsb." />
+          </Field>
+        )}
+      </div>
+
+      <div className="flex justify-end gap-2 border-t border-stone-200 pt-4">
+        <Tombol varian="garis" onClick={onBatal}>Batal</Tombol>
+        <Tombol onClick={simpan} ikon={Check}>Simpan data</Tombol>
+      </div>
+    </div>
+  );
+}
+
+function DatabaseKaryawan({ karyawan, setKaryawan, peran, cari, setCari }) {
+  const [buka, setBuka] = useState(false);
+  const [sunting, setSunting] = useState(null);
+  const [filterDept, setFilterDept] = useState("Semua");
+
+  const daftar = karyawan.filter((k) => {
+    if (k.status !== "Active") return false;
+    if (filterDept !== "Semua" && k.departemen !== filterDept) return false;
+    const q = cari.trim().toLowerCase();
+    if (!q) return true;
+    return [k.nama, k.npk, k.departemen, k.section, k.level].join(" ").toLowerCase().includes(q);
+  });
+
+  const simpan = (data) => {
+    setKaryawan((prev) => {
+      const ada = prev.some((k) => k.id === data.id);
+      const hasil = { ...data };
+      if (hasil.status === "Inactive" && !hasil.inactiveDate) hasil.inactiveDate = iso(TODAY);
+      if (hasil.status === "Active") { hasil.inactiveDate = null; hasil.alasanInactive = null; }
+      return ada ? prev.map((k) => (k.id === data.id ? hasil : k)) : [...prev, hasil];
+    });
+    setBuka(false); setSunting(null);
+  };
+
+  return (
+    <div className="space-y-4">
+      <div className="flex flex-wrap items-end justify-between gap-3">
+        <div>
+          <h1 className="text-2xl font-semibold text-slate-900">Database karyawan</h1>
+          <p className="text-sm text-slate-500">{daftar.length} karyawan aktif ditampilkan</p>
+        </div>
+        <div className="flex items-center gap-2">
+          <select value={filterDept} onChange={(e) => setFilterDept(e.target.value)} className={`${inputCls} w-48 py-1.5`}>
+            <option>Semua</option>{DEPARTEMEN.map((d) => <option key={d}>{d}</option>)}
+          </select>
+          <Tombol ikon={Plus} onClick={() => { setSunting(null); setBuka(true); }}>Tambah karyawan</Tombol>
+        </div>
+      </div>
+
+      {cari.trim() && (
+        <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
+          {daftar.map((k) => (
+            <button key={k.id} onClick={() => { setSunting(k); setBuka(true); }}
+              className="flex items-center gap-3 rounded border border-stone-300 bg-white p-3 text-left hover:border-teal-700">
+              <Avatar nama={k.nama} foto={k.foto} size={48} />
+              <div className="min-w-0">
+                <p className="truncate font-medium text-slate-900">{k.nama}</p>
+                <p className="text-xs tabular-nums text-slate-500">{k.npk}</p>
+                <p className="truncate text-xs text-slate-600">{k.departemen} · {k.level}</p>
+              </div>
+            </button>
+          ))}
+          {daftar.length === 0 && <div className="sm:col-span-2 lg:col-span-3"><Kosong pesan={`Tidak ada karyawan yang cocok dengan "${cari}".`} /></div>}
+        </div>
+      )}
+
+      <div className="overflow-x-auto rounded border border-stone-300 bg-white">
+        <table className="w-full min-w-max text-sm">
+          <thead className="bg-stone-100 text-left text-xs uppercase tracking-wide text-slate-500">
+            <tr>
+              <th className="px-4 py-2.5 font-medium">Karyawan</th>
+              <th className="px-3 font-medium">NPK</th>
+              <th className="px-3 font-medium">Departemen</th>
+              <th className="px-3 font-medium">Section</th>
+              <th className="px-3 font-medium">Level</th>
+              <th className="px-3 font-medium">Status</th>
+              <th className="px-3 font-medium">Usia</th>
+              <th className="px-3 font-medium">Kontrak</th>
+              <th className="px-3 font-medium">Cuti</th>
+              <th className="px-3 font-medium"></th>
+            </tr>
+          </thead>
+          <tbody>
+            {daftar.map((k) => {
+              const sisa = k.employmentStatus === "PKWT" ? sisaHariKontrak(k.kontrakExpired) : null;
+              return (
+                <tr key={k.id} className="border-t border-stone-200 hover:bg-stone-50">
+                  <td className="px-4 py-2.5">
+                    <div className="flex items-center gap-2.5">
+                      <Avatar nama={k.nama} foto={k.foto} size={32} />
+                      <div>
+                        <p className="font-medium text-slate-900">{k.nama}</p>
+                        <p className="text-xs text-slate-500">{k.jenisKelamin === "L" ? "Laki-laki" : "Perempuan"} · {k.pendidikan}</p>
+                      </div>
+                    </div>
+                  </td>
+                  <td className="px-3 tabular-nums text-slate-600">{k.npk}</td>
+                  <td className="px-3 text-slate-700">{k.departemen}</td>
+                  <td className="px-3 text-slate-600">{k.section || "—"}</td>
+                  <td className="px-3 text-slate-600">{k.level}</td>
+                  <td className="px-3"><Lencana warna="bg-teal-50 text-teal-900">{k.employmentStatus}</Lencana></td>
+                  <td className="px-3 tabular-nums text-slate-600">{hitungUsia(k.tanggalLahir)}</td>
+                  <td className="px-3">
+                    {sisa == null ? <span className="text-slate-400">—</span> : (
+                      <span className={`tabular-nums ${sisa <= 30 ? "font-medium text-red-700" : "text-slate-600"}`}>{sisa} hari</span>
+                    )}
+                  </td>
+                  <td className="px-3 tabular-nums text-slate-600">{k.sisaCuti}/{k.jatahCuti}</td>
+                  <td className="px-3 text-right">
+                    <Tombol kecil varian="sunyi" ikon={Pencil} onClick={() => { setSunting(k); setBuka(true); }}>Ubah</Tombol>
+                  </td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+        {daftar.length === 0 && <div className="p-8 text-center text-sm text-slate-500">Belum ada data yang cocok dengan filter ini.</div>}
+      </div>
+
+      <Modal open={buka} onClose={() => setBuka(false)} lebar="max-w-5xl"
+        title={sunting ? `Ubah data — ${sunting.nama}` : "Tambah karyawan baru"}>
+        <FormKaryawan awal={sunting} peran={peran} onSimpan={simpan} onBatal={() => setBuka(false)} />
+      </Modal>
+    </div>
+  );
+}
+
+function KaryawanNonaktif({ karyawan }) {
+  const daftar = karyawan.filter((k) => k.status === "Inactive")
+    .sort((a, b) => (b.inactiveDate || "").localeCompare(a.inactiveDate || ""));
+  return (
+    <div className="space-y-4">
+      <div>
+        <h1 className="text-2xl font-semibold text-slate-900">Karyawan nonaktif</h1>
+        <p className="text-sm text-slate-500">
+          Data berpindah ke sini otomatis saat status diubah menjadi Inactive atau form resign disetujui Super Admin.
+        </p>
+      </div>
+      {daftar.length === 0 ? (
+        <Kosong pesan="Belum ada karyawan nonaktif pada periode ini." />
+      ) : (
+        <div className="overflow-x-auto rounded border border-stone-300 bg-white">
+          <table className="w-full min-w-max text-sm">
+            <thead className="bg-stone-100 text-left text-xs uppercase tracking-wide text-slate-500">
+              <tr>
+                <th className="px-4 py-2.5 font-medium">Nama</th><th className="px-3 font-medium">NPK</th>
+                <th className="px-3 font-medium">Dept</th><th className="px-3 font-medium">Section</th>
+                <th className="px-3 font-medium">Level</th><th className="px-3 font-medium">Inactive date</th>
+                <th className="px-3 font-medium">Reason</th>
+              </tr>
+            </thead>
+            <tbody>
+              {daftar.map((k) => (
+                <tr key={k.id} className="border-t border-stone-200">
+                  <td className="px-4 py-2.5 font-medium text-slate-800">{k.nama}</td>
+                  <td className="px-3 tabular-nums text-slate-600">{k.npk}</td>
+                  <td className="px-3 text-slate-600">{k.departemen}</td>
+                  <td className="px-3 text-slate-600">{k.section || "—"}</td>
+                  <td className="px-3 text-slate-600">{k.level}</td>
+                  <td className="px-3 text-slate-600">{tglPanjang(k.inactiveDate)}</td>
+                  <td className="px-3 text-slate-600">{k.alasanInactive || "—"}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </div>
+  );
+}
+
+/* ============================================================================
+   ABSENSI
+   ========================================================================== */
+
+function Absensi({ karyawan, absensi, setAbsensi, geofence, setGeofence, peran, sesi }) {
+  const p = periodeDari();
+  const [tab, setTab] = useState(peran === "user" ? "saya" : "rekap");
+  const [posisi, setPosisi] = useState(null);
+  const [pesan, setPesan] = useState(null);
+  const [simulasi, setSimulasi] = useState("dalam");
+  const [bukaGeo, setBukaGeo] = useState(false);
+
+  const rec = absensi[p.kunci] || {};
+  const hari = hariDalamPeriode(p);
+  const aktif = karyawan.filter((k) => k.status === "Active");
+  const sayaNpk = sesi.npk;
+  const sayaData = karyawan.find((k) => k.npk === sayaNpk);
+
+  const rekap = (npk) => {
+    const r = rec[npk] || {};
+    const c = { H: 0, S: 0, C: 0, I: 0, M: 0, "H/TLK": 0 };
+    Object.values(r).forEach((v) => { if (c[v] !== undefined) c[v]++; });
+    return c;
+  };
+
+  const ambilPosisi = () => {
+    setPesan(null);
+    const pakai = (lat, lng) => {
+      const d = jarakMeter(lat, lng, geofence.latitude, geofence.longitude);
+      setPosisi({ lat, lng, jarak: d, dalam: d <= geofence.radius });
+    };
+    if (navigator.geolocation) {
+      navigator.geolocation.getCurrentPosition(
+        (pos) => pakai(pos.coords.latitude, pos.coords.longitude),
+        () => {
+          const off = simulasi === "dalam" ? 0.0004 : 0.02;
+          pakai(geofence.latitude + off, geofence.longitude + off);
+        },
+        { timeout: 4000 }
+      );
+    } else {
+      const off = simulasi === "dalam" ? 0.0004 : 0.02;
+      pakai(geofence.latitude + off, geofence.longitude + off);
+    }
+  };
+
+  const absenMasuk = () => {
+    if (!posisi) return;
+    if (!posisi.dalam) return setPesan({ tipe: "galat", teks: `Anda berada ${posisi.jarak} m dari ${geofence.nama}. Absen hanya bisa dilakukan dalam radius ${geofence.radius} m.` });
+    const t = iso(TODAY);
+    setAbsensi((prev) => ({ ...prev, [p.kunci]: { ...(prev[p.kunci] || {}), [sayaNpk]: { ...((prev[p.kunci] || {})[sayaNpk] || {}), [t]: "H" } } }));
+    setPesan({ tipe: "sukses", teks: `Absen tercatat ${tglPanjang(t)} pada titik ${geofence.nama}, jarak ${posisi.jarak} m.` });
+  };
+
+  const ubahSel = (npk, tanggal, nilai) => {
+    setAbsensi((prev) => {
+      const per = { ...(prev[p.kunci] || {}) };
+      const baris = { ...(per[npk] || {}) };
+      if (nilai) baris[tanggal] = nilai; else delete baris[tanggal];
+      per[npk] = baris;
+      return { ...prev, [p.kunci]: per };
+    });
+  };
+
+  const sudahAbsenHariIni = (rec[sayaNpk] || {})[iso(TODAY)];
+
+  return (
+    <div className="space-y-4">
+      <div className="flex flex-wrap items-end justify-between gap-3">
+        <div>
+          <h1 className="text-2xl font-semibold text-slate-900">Absensi</h1>
+          <p className="text-sm text-slate-500">Periode berjalan {labelPeriode(p)}</p>
+        </div>
+        <div className="flex items-center gap-2">
+          {peran !== "user" && (
+            <>
+              <Tombol varian="garis" ikon={MapPin} onClick={() => setBukaGeo(true)}>Titik absen</Tombol>
+              <Tombol varian="garis" ikon={Printer} onClick={() => window.print()}>Cetak PDF</Tombol>
+            </>
+          )}
+        </div>
+      </div>
+
+      <div className="flex gap-1 border-b border-stone-300">
+        {[["saya", "Absen saya"], ...(peran !== "user" ? [["rekap", "Rekap periode"], ["lembar", "Lembar harian"]] : [])].map(([k, l]) => (
+          <button key={k} onClick={() => setTab(k)}
+            className={`-mb-px border-b-2 px-4 py-2 text-sm font-medium ${tab === k ? "border-teal-800 text-teal-900" : "border-transparent text-slate-500 hover:text-slate-800"}`}>
+            {l}
+          </button>
+        ))}
+      </div>
+
+      {tab === "saya" && (
+        <div className="grid gap-4 lg:grid-cols-3">
+          <Panel judul="Absen hari ini" className="lg:col-span-1">
+            <p className="text-sm text-slate-600">{tglPanjang(iso(TODAY))}</p>
+            <div className="mt-3 rounded bg-stone-100 p-3 text-sm">
+              <p className="flex items-center gap-2 font-medium text-slate-800"><MapPin size={14} /> {geofence.nama}</p>
+              <p className="mt-1 tabular-nums text-xs text-slate-500">
+                {geofence.latitude}, {geofence.longitude} · radius {geofence.radius} m
+              </p>
+            </div>
+
+            {!posisi ? (
+              <div className="mt-3 space-y-2">
+                <select value={simulasi} onChange={(e) => setSimulasi(e.target.value)} className={inputCls}>
+                  <option value="dalam">Simulasi: di dalam area plant</option>
+                  <option value="luar">Simulasi: di luar area plant</option>
+                </select>
+                <Tombol ikon={Crosshair} onClick={ambilPosisi}>Deteksi lokasi saya</Tombol>
+                <p className="text-xs text-slate-400">
+                  Jika izin lokasi peramban ditolak, koordinat simulasi di atas yang dipakai.
+                </p>
+              </div>
+            ) : (
+              <div className="mt-3 space-y-3">
+                <div className={`rounded p-3 text-sm ${posisi.dalam ? "bg-emerald-50 text-emerald-900" : "bg-red-50 text-red-900"}`}>
+                  <p className="font-medium">{posisi.dalam ? "Anda di dalam area absen" : "Anda di luar area absen"}</p>
+                  <p className="tabular-nums text-xs">Jarak ke titik plant: {posisi.jarak} m</p>
+                  <p className="tabular-nums text-xs">Koordinat: {posisi.lat.toFixed(5)}, {posisi.lng.toFixed(5)}</p>
+                </div>
+                {sudahAbsenHariIni ? (
+                  <p className="flex items-center gap-2 text-sm font-medium text-emerald-800"><Check size={15} /> Sudah absen hari ini</p>
+                ) : (
+                  <Tombol varian="aksi" ikon={Clock} onClick={absenMasuk} disabled={!posisi.dalam}>Catat absen masuk</Tombol>
+                )}
+                <button onClick={() => { setPosisi(null); setPesan(null); }} className="block text-xs text-slate-500 hover:underline">Deteksi ulang</button>
+              </div>
+            )}
+            {pesan && (
+              <p className={`mt-3 rounded px-3 py-2 text-xs ${pesan.tipe === "sukses" ? "bg-emerald-50 text-emerald-900" : "bg-red-50 text-red-900"}`}>{pesan.teks}</p>
+            )}
+          </Panel>
+
+          <Panel judul="Rekap saya periode ini" className="lg:col-span-2">
+            {!sayaData ? (
+              <p className="text-sm text-slate-500">Akun ini tidak tertaut ke data karyawan mana pun.</p>
+            ) : (
+              <>
+                <div className="grid grid-cols-3 gap-px overflow-hidden rounded border border-stone-200 bg-stone-200 sm:grid-cols-6">
+                  {Object.entries(rekap(sayaNpk)).map(([k, v]) => (
+                    <div key={k} className="bg-white px-3 py-2 text-center">
+                      <p className="text-xl font-semibold tabular-nums text-slate-900">{v}</p>
+                      <p className="text-xs text-slate-500">{KODE_ABSEN[k].label}</p>
+                    </div>
+                  ))}
+                </div>
+                <div className="mt-4 flex flex-wrap gap-1">
+                  {hari.map((d) => {
+                    const v = (rec[sayaNpk] || {})[iso(d)];
+                    const minggu = d.getDay() === 0;
+                    return (
+                      <div key={iso(d)} title={`${tglPendek(iso(d))}${v ? ` — ${KODE_ABSEN[v].label}` : ""}`}
+                        className={`flex h-10 w-10 flex-col items-center justify-center rounded border text-xs ${
+                          minggu ? "border-stone-200 bg-stone-100 text-slate-400"
+                          : v ? `border-transparent ${KODE_ABSEN[v].warna}` : "border-stone-200 text-slate-400"}`}>
+                        <span className="tabular-nums">{d.getDate()}</span>
+                        <span className="text-[10px] font-medium">{minggu ? "•" : v || ""}</span>
+                      </div>
+                    );
+                  })}
+                </div>
+              </>
+            )}
+          </Panel>
+        </div>
+      )}
+
+      {tab === "rekap" && peran !== "user" && (
+        <div id="area-cetak" className="overflow-x-auto rounded border border-stone-300 bg-white p-0">
+          <div className="hanya-cetak border-b border-slate-900 px-4 py-3" style={{ display: "none" }}>
+            <p className="text-base font-bold">PT SINAR SEJAHTERA MANDIRI INDONESIA</p>
+            <p className="text-xs">Rekapitulasi Absensi Periode {labelPeriode(p)}</p>
+          </div>
+          <table className="w-full min-w-max text-sm">
+            <thead className="bg-stone-100 text-left text-xs uppercase tracking-wide text-slate-500">
+              <tr>
+                <th className="px-4 py-2.5 font-medium">Karyawan</th><th className="px-3 font-medium">NPK</th>
+                <th className="px-3 font-medium">Dept</th>
+                {Object.keys(KODE_ABSEN).map((k) => <th key={k} className="px-3 text-center font-medium">{k}</th>)}
+                <th className="px-3 text-center font-medium">Total</th>
+              </tr>
+            </thead>
+            <tbody>
+              {aktif.map((k) => {
+                const r = rekap(k.npk);
+                const total = Object.values(r).reduce((a, b) => a + b, 0);
+                return (
+                  <tr key={k.id} className="border-t border-stone-200 hover:bg-stone-50">
+                    <td className="px-4 py-2 font-medium text-slate-800">{k.nama}</td>
+                    <td className="px-3 tabular-nums text-slate-600">{k.npk}</td>
+                    <td className="px-3 text-slate-600">{k.departemen}</td>
+                    {Object.keys(KODE_ABSEN).map((kode) => (
+                      <td key={kode} className="px-3 text-center tabular-nums text-slate-700">{r[kode] || "—"}</td>
+                    ))}
+                    <td className="px-3 text-center font-medium tabular-nums">{total}</td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+      )}
+
+      {tab === "lembar" && peran !== "user" && (
+        <div id="area-cetak" className="overflow-x-auto rounded border border-stone-300 bg-white">
+          <table className="min-w-max text-xs">
+            <thead className="bg-stone-100 text-slate-500">
+              <tr>
+                <th className="sticky left-0 z-10 bg-stone-100 px-3 py-2 text-left font-medium">Karyawan</th>
+                {hari.map((d) => (
+                  <th key={iso(d)} className={`w-8 px-1 py-2 text-center font-medium tabular-nums ${d.getDay() === 0 ? "text-red-500" : ""}`}>
+                    {d.getDate()}
+                  </th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {aktif.map((k) => (
+                <tr key={k.id} className="border-t border-stone-200">
+                  <td className="sticky left-0 z-10 bg-white px-3 py-1.5 font-medium text-slate-800">{k.nama}</td>
+                  {hari.map((d) => {
+                    const t = iso(d);
+                    const v = (rec[k.npk] || {})[t] || "";
+                    return (
+                      <td key={t} className="p-0.5">
+                        <select value={v} onChange={(e) => ubahSel(k.npk, t, e.target.value)}
+                          className={`w-9 rounded border-0 py-1 text-center text-xs tabular-nums focus:ring-1 focus:ring-teal-700 ${
+                            v ? KODE_ABSEN[v].warna : d.getDay() === 0 ? "bg-stone-100 text-slate-300" : "bg-white text-slate-400"}`}>
+                          <option value=""></option>
+                          {Object.keys(KODE_ABSEN).map((kode) => <option key={kode} value={kode}>{kode}</option>)}
+                        </select>
+                      </td>
+                    );
+                  })}
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+
+      <Modal open={bukaGeo} onClose={() => setBukaGeo(false)} title="Pengaturan titik absen" lebar="max-w-lg">
+        <PengaturanGeofence geofence={geofence} setGeofence={setGeofence} onSelesai={() => setBukaGeo(false)} />
+      </Modal>
+    </div>
+  );
+}
+
+function PengaturanGeofence({ geofence, setGeofence, onSelesai }) {
+  const [f, setF] = useState(geofence);
+  return (
+    <div className="space-y-4">
+      <p className="text-sm text-slate-600">
+        Karyawan hanya bisa mencatat absen ketika perangkatnya berada dalam radius titik ini.
+      </p>
+      <Field label="Nama lokasi"><input value={f.nama} onChange={(e) => setF({ ...f, nama: e.target.value })} className={inputCls} /></Field>
+      <div className="grid gap-4 sm:grid-cols-3">
+        <Field label="Latitude"><input type="number" step="0.0001" value={f.latitude} onChange={(e) => setF({ ...f, latitude: Number(e.target.value) })} className={inputCls} /></Field>
+        <Field label="Longitude"><input type="number" step="0.0001" value={f.longitude} onChange={(e) => setF({ ...f, longitude: Number(e.target.value) })} className={inputCls} /></Field>
+        <Field label="Radius (meter)"><input type="number" value={f.radius} onChange={(e) => setF({ ...f, radius: Number(e.target.value) })} className={inputCls} /></Field>
+      </div>
+      <div className="flex justify-end gap-2 border-t border-stone-200 pt-4">
+        <Tombol varian="garis" onClick={onSelesai}>Batal</Tombol>
+        <Tombol onClick={() => { setGeofence(f); onSelesai(); }}>Simpan titik absen</Tombol>
+      </div>
+    </div>
+  );
+}
+
+/* ============================================================================
+   PERIZINAN — FORM A5, WORKFLOW BERJENJANG
+   ========================================================================== */
+
+/** Kategori yang boleh diajukan karyawan. Perpanjangan kontrak diajukan Admin. */
+const KATEGORI_USER = ["Izin", "Sakit", "Cuti", "Tugas Luar Kota", "Resign"];
+
+/** Kartu tanda tangan tersimpan — dipakai di halaman profil semua peran. */
+function KartuTandaTangan({ sesi, onSimpan }) {
+  const [sunting, setSunting] = useState(!sesi.ttd);
+  const [draf, setDraf] = useState(sesi.ttd || null);
+  const [tersimpan, setTersimpan] = useState(false);
+
+  return (
+    <Panel judul="Tanda tangan digital">
+      {!sunting && sesi.ttd ? (
+        <div>
+          <div className="flex h-28 items-center justify-center border border-stone-300 bg-white">
+            <img src={sesi.ttd} alt="Tanda tangan tersimpan" className="max-h-24 object-contain" />
+          </div>
+          <p className="mt-2 text-xs text-slate-500">
+            Tanda tangan ini otomatis dibubuhkan pada setiap form yang Anda ajukan atau setujui.
+          </p>
+          <div className="mt-3">
+            <Tombol kecil varian="garis" ikon={PenLine} onClick={() => { setSunting(true); setTersimpan(false); }}>
+              Ganti tanda tangan
+            </Tombol>
+          </div>
+        </div>
+      ) : (
+        <div>
+          <TandaTangan key={sesi.id + String(sunting)} nilai={draf} onChange={setDraf} nama={sesi.nama} />
+          <div className="mt-3 flex items-center gap-2">
+            <Tombol kecil ikon={Check} disabled={!draf}
+              onClick={() => { onSimpan(draf); setSunting(false); setTersimpan(true); }}>
+              Simpan tanda tangan
+            </Tombol>
+            {sesi.ttd && <Tombol kecil varian="sunyi" onClick={() => { setDraf(sesi.ttd); setSunting(false); }}>Batal</Tombol>}
+          </div>
+          <p className="mt-2 text-xs text-slate-500">Tanda tangan cukup dibuat sekali dan tersimpan di profil Anda.</p>
+        </div>
+      )}
+      {tersimpan && <p className="mt-2 text-xs text-emerald-700">Tanda tangan tersimpan.</p>}
+    </Panel>
+  );
+}
+
+function FormPengajuan({ sesi, karyawan, onKirim, onBatal }) {
+  const saya = karyawan.find((k) => k.npk === sesi.npk);
+  const [f, setF] = useState({
+    kategori: "Izin", tglMulai: iso(TODAY), tglSelesai: iso(TODAY), alasan: "",
+  });
+
+  const jumlahHari = Math.max(1, Math.round((parse(f.tglSelesai) - parse(f.tglMulai)) / 86400000) + 1);
+
+  const kirim = () => {
+    if (!f.alasan.trim()) return alert("Tuliskan keterangan pengajuan.");
+    if (!sesi.ttd) return alert("Buat tanda tangan digital di halaman Profil saya terlebih dahulu.");
+    if (f.kategori === "Cuti" && saya && jumlahHari > saya.sisaCuti)
+      return alert(`Sisa cuti Anda ${saya.sisaCuti} hari, tidak cukup untuk ${jumlahHari} hari.`);
+    onKirim({
+      id: uid(), npk: sesi.npk, nama: saya?.nama || sesi.nama, departemen: saya?.departemen || "—",
+      kategori: f.kategori, tglMulai: f.tglMulai, tglSelesai: f.tglSelesai, jumlahHari,
+      alasan: f.alasan, status: "Menunggu Admin", ttdUser: sesi.ttd, ttdAdmin: null, ttdSuper: null,
+      namaAdmin: null, namaSuper: null,
+      riwayat: [{ oleh: saya?.nama || sesi.nama, aksi: "Mengajukan", tgl: iso(TODAY) }],
+    });
+  };
+
+  return (
+    <div className="space-y-4">
+      <div className="grid gap-4 sm:grid-cols-2">
+        <Field label="Jenis pengajuan">
+          <select value={f.kategori} onChange={(e) => setF({ ...f, kategori: e.target.value })} className={inputCls}>
+            {KATEGORI_USER.map((k) => <option key={k}>{k}</option>)}
+          </select>
+        </Field>
+        <Field label="Sisa cuti Anda">
+          <input disabled className={inputCls} value={saya ? `${saya.sisaCuti} dari ${saya.jatahCuti} hari` : "—"} />
+        </Field>
+        <Field label="Tanggal mulai"><input type="date" value={f.tglMulai} onChange={(e) => setF({ ...f, tglMulai: e.target.value })} className={inputCls} /></Field>
+        <Field label="Tanggal selesai" hint={`${jumlahHari} hari`}>
+          <input type="date" value={f.tglSelesai} onChange={(e) => setF({ ...f, tglSelesai: e.target.value })} className={inputCls} />
+        </Field>
+      </div>
+      <Field label="Keterangan">
+        <textarea rows={3} value={f.alasan} onChange={(e) => setF({ ...f, alasan: e.target.value })}
+          className={inputCls} placeholder="Jelaskan keperluan secara singkat" />
+      </Field>
+      <Field label="Tanda tangan pemohon" hint="Diambil dari tanda tangan tersimpan di profil Anda">
+        {sesi.ttd ? (
+          <div className="flex items-center gap-3 rounded border border-stone-300 bg-white p-3">
+            <img src={sesi.ttd} alt="Tanda tangan Anda" className="h-16 object-contain" />
+            <span className="text-sm text-slate-600">{saya?.nama || sesi.nama}</span>
+          </div>
+        ) : (
+          <p className="flex items-start gap-2 rounded bg-amber-50 px-3 py-2 text-sm text-amber-900">
+            <AlertTriangle size={15} className="mt-0.5 shrink-0" />
+            Belum ada tanda tangan tersimpan. Buka menu Profil saya untuk membuatnya sekali saja.
+          </p>
+        )}
+      </Field>
+      <div className="flex items-center justify-between border-t border-stone-200 pt-4">
+        <p className="text-xs text-slate-500">Setelah dikirim, form masuk ke Admin lalu Super Admin.</p>
+        <div className="flex gap-2">
+          <Tombol varian="garis" onClick={onBatal}>Batal</Tombol>
+          <Tombol onClick={kirim} ikon={FileSignature}>Kirim pengajuan</Tombol>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/** Perpanjangan kontrak diajukan Admin/Super Admin, bukan karyawan. */
+function FormPerpanjanganKontrak({ sesi, karyawan, onKirim, onBatal }) {
+  const kandidat = karyawan
+    .filter((k) => k.status === "Active" && k.employmentStatus === "PKWT")
+    .sort((a, b) => (a.kontrakExpired || "").localeCompare(b.kontrakExpired || ""));
+  const [npk, setNpk] = useState(kandidat[0]?.npk || "");
+  const [akhirBaru, setAkhirBaru] = useState("");
+  const [catatan, setCatatan] = useState("");
+
+  const target = karyawan.find((k) => k.npk === npk);
+  const sisa = target ? sisaHariKontrak(target.kontrakExpired) : null;
+
+  const kirim = () => {
+    if (!target) return alert("Pilih karyawan yang akan diperpanjang.");
+    if (!akhirBaru) return alert("Tentukan tanggal berakhir kontrak yang baru.");
+    if (target.kontrakExpired && parse(akhirBaru) <= parse(target.kontrakExpired))
+      return alert("Tanggal baru harus melewati tanggal berakhir kontrak saat ini.");
+    if (!sesi.ttd) return alert("Buat tanda tangan digital di halaman Profil saya terlebih dahulu.");
+
+    const admin = sesi.role === "admin";
+    onKirim({
+      id: uid(), npk: target.npk, nama: target.nama, departemen: target.departemen,
+      kategori: "Perpanjangan Kontrak",
+      tglMulai: target.kontrakExpired || iso(TODAY), tglSelesai: akhirBaru,
+      jumlahHari: Math.max(1, Math.round((parse(akhirBaru) - parse(target.kontrakExpired || iso(TODAY))) / 86400000)),
+      alasan: catatan.trim() || `Perpanjangan PKWT sampai ${tglPanjang(akhirBaru)}.`,
+      status: "Menunggu Super Admin",
+      ttdUser: null, ttdAdmin: sesi.ttd, ttdSuper: admin ? null : sesi.ttd,
+      namaAdmin: sesi.nama, namaSuper: null,
+      diajukanAdmin: true,
+      riwayat: [{ oleh: sesi.nama, aksi: "Diajukan HRGA", tgl: iso(TODAY) }],
+    });
+  };
+
+  return (
+    <div className="space-y-4">
+      <p className="text-sm text-slate-600">
+        Pengajuan ini langsung masuk ke Super Admin untuk ditandatangani. Setelah disetujui, tanggal
+        berakhir kontrak karyawan diperbarui otomatis.
+      </p>
+      <div className="grid gap-4 sm:grid-cols-2">
+        <Field label="Karyawan PKWT" wajib>
+          <select value={npk} onChange={(e) => setNpk(e.target.value)} className={inputCls}>
+            {kandidat.map((k) => <option key={k.id} value={k.npk}>{k.npk} — {k.nama}</option>)}
+          </select>
+        </Field>
+        <Field label="Kontrak berakhir saat ini" hint={sisa != null ? `${sisa} hari lagi` : undefined}>
+          <input disabled className={inputCls} value={tglPanjang(target?.kontrakExpired)} />
+        </Field>
+        <Field label="Diperpanjang sampai" wajib>
+          <input type="date" value={akhirBaru} onChange={(e) => setAkhirBaru(e.target.value)} className={inputCls} />
+        </Field>
+        <Field label="Departemen"><input disabled className={inputCls} value={target?.departemen || "—"} /></Field>
+      </div>
+      <Field label="Catatan HRGA">
+        <textarea rows={2} value={catatan} onChange={(e) => setCatatan(e.target.value)} className={inputCls}
+          placeholder="Dasar perpanjangan, hasil evaluasi kinerja, dsb." />
+      </Field>
+      <Field label="Tanda tangan HRGA" hint="Diambil dari profil Anda">
+        {sesi.ttd ? (
+          <div className="flex items-center gap-3 rounded border border-stone-300 bg-white p-3">
+            <img src={sesi.ttd} alt="Tanda tangan Anda" className="h-16 object-contain" />
+            <span className="text-sm text-slate-600">{sesi.nama}</span>
+          </div>
+        ) : (
+          <p className="rounded bg-amber-50 px-3 py-2 text-sm text-amber-900">
+            Belum ada tanda tangan tersimpan. Buka menu Profil saya untuk membuatnya.
+          </p>
+        )}
+      </Field>
+      {kandidat.length === 0 && (
+        <p className="rounded bg-stone-100 px-3 py-2 text-sm text-slate-600">Tidak ada karyawan PKWT aktif saat ini.</p>
+      )}
+      <div className="flex justify-end gap-2 border-t border-stone-200 pt-4">
+        <Tombol varian="garis" onClick={onBatal}>Batal</Tombol>
+        <Tombol onClick={kirim} ikon={FileSignature} disabled={kandidat.length === 0}>Kirim ke Super Admin</Tombol>
+      </div>
+    </div>
+  );
+}
+
+/** Form cetak presisi A5 (148 × 210 mm). */
+function FormA5({ izin }) {
+  return (
+    <div id="area-cetak" className="mx-auto bg-white text-slate-900"
+      style={{ width: "148mm", minHeight: "210mm", padding: "12mm", fontSize: "10pt", lineHeight: 1.45 }}>
+      <style>{`@media print { @page { size: A5 portrait; margin: 0; } }`}</style>
+
+      <header className="flex items-start justify-between border-b-2 border-slate-900 pb-2">
+        <div>
+          <p className="text-base font-bold leading-tight">PT SINAR SEJAHTERA MANDIRI INDONESIA</p>
+          <p className="text-xs text-slate-600">Jl. Raya Industri No. 17, Pemalang, Jawa Tengah</p>
+        </div>
+        <div className="flex h-9 w-9 items-center justify-center bg-slate-900 text-lg font-bold text-white">S</div>
+      </header>
+
+      <h1 className="mt-4 text-center text-sm font-bold tracking-wide underline">
+        FORMULIR PERMOHONAN {izin.kategori.toUpperCase()}
+      </h1>
+      <p className="text-center text-xs text-slate-600">No. {izin.id.toUpperCase()}</p>
+
+      <table className="mt-4 w-full text-xs">
+        <tbody>
+          {[
+            ["Nama", izin.nama], ["NPK", izin.npk], ["Departemen", izin.departemen],
+            ["Jenis izin", izin.kategori],
+            ["Tanggal", `${tglPanjang(izin.tglMulai)} s.d. ${tglPanjang(izin.tglSelesai)}`],
+            ["Lama", `${izin.jumlahHari} hari kerja`],
+          ].map(([l, v]) => (
+            <tr key={l}>
+              <td className="w-28 py-1 align-top text-slate-600">{l}</td>
+              <td className="py-1 align-top font-medium">: {v}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+
+      <div className="mt-2">
+        <p className="text-xs text-slate-600">Keterangan</p>
+        <p className="mt-1 min-h-[16mm] border border-slate-300 p-2 text-xs">{izin.alasan}</p>
+      </div>
+
+      <div className="mt-6 grid grid-cols-3 gap-3">
+        <TtdTersimpan nilai={izin.ttdUser} nama={izin.ttdUser ? izin.nama : ""}
+          peran={izin.diajukanAdmin ? "Diketahui karyawan" : "Pemohon"} />
+        <TtdTersimpan nilai={izin.ttdAdmin} nama={izin.namaAdmin || ""} peran="Diperiksa HRGA" />
+        <TtdTersimpan nilai={izin.ttdSuper} nama={izin.namaSuper || ""} peran="Disetujui Direksi" />
+      </div>
+
+      <p className="mt-6 border-t border-slate-300 pt-2 text-center text-xs text-slate-500">
+        Status akhir: {izin.status} · Dicetak {tglPanjang(iso(TODAY))}
+      </p>
+    </div>
+  );
+}
+
+function Perizinan({ izin, setIzin, sesi, karyawan, setKaryawan, setAbsensi }) {
+  const [bukaForm, setBukaForm] = useState(false);
+  const [bukaKontrak, setBukaKontrak] = useState(false);
+  const [lihat, setLihat] = useState(null);
+  const [cetak, setCetak] = useState(null);
+  const peran = sesi.role;
+
+  const daftar = peran === "user" ? izin.filter((i) => i.npk === sesi.npk) : izin;
+  const antrianSaya = izin.filter((i) =>
+    (peran === "admin" && i.status === "Menunggu Admin") ||
+    (peran === "superadmin" && i.status === "Menunggu Super Admin")
+  );
+
+  const kirimBaru = (data) => { setIzin((p) => [data, ...p]); setBukaForm(false); };
+
+  const terapkanEfek = (i) => {
+    // Cuti: potong sisa cuti. TLK: tandai H/TLK. Resign: karyawan jadi nonaktif.
+    if (i.kategori === "Cuti") {
+      setKaryawan((prev) => prev.map((k) => (k.npk === i.npk ? { ...k, sisaCuti: Math.max(0, k.sisaCuti - i.jumlahHari) } : k)));
+    }
+    if (i.kategori === "Tugas Luar Kota" || i.kategori === "Cuti" || i.kategori === "Izin" || i.kategori === "Sakit") {
+      const kode = { "Tugas Luar Kota": "H/TLK", Cuti: "C", Izin: "I", Sakit: "S" }[i.kategori];
+      const p = periodeDari();
+      setAbsensi((prev) => {
+        const per = { ...(prev[p.kunci] || {}) };
+        const baris = { ...(per[i.npk] || {}) };
+        for (let d = parse(i.tglMulai); d <= parse(i.tglSelesai); d.setDate(d.getDate() + 1)) {
+          if (d >= p.mulai && d <= p.akhir) baris[iso(d)] = kode;
+        }
+        per[i.npk] = baris;
+        return { ...prev, [p.kunci]: per };
+      });
+    }
+    if (i.kategori === "Resign") {
+      setKaryawan((prev) => prev.map((k) =>
+        k.npk === i.npk ? { ...k, status: "Inactive", inactiveDate: i.tglMulai, alasanInactive: i.alasan } : k));
+    }
+    if (i.kategori === "Perpanjangan Kontrak") {
+      setKaryawan((prev) => prev.map((k) =>
+        k.npk === i.npk ? { ...k, kontrakExpired: i.tglSelesai, employmentStatus: "PKWT", status: "Active" } : k));
+    }
+  };
+
+  const proses = (i, aksi) => {
+    if (!sesi.ttd) return alert("Buat tanda tangan digital di halaman Profil saya terlebih dahulu.");
+    setIzin((prev) => prev.map((x) => {
+      if (x.id !== i.id) return x;
+      if (peran === "admin") {
+        return {
+          ...x, ttdAdmin: sesi.ttd, namaAdmin: sesi.nama,
+          status: aksi === "tolak" ? "Ditolak" : "Menunggu Super Admin",
+          riwayat: [...x.riwayat, { oleh: sesi.nama, aksi: aksi === "tolak" ? "Ditolak Admin" : "Diteruskan ke Super Admin", tgl: iso(TODAY) }],
+        };
+      }
+      return {
+        ...x, ttdSuper: sesi.ttd, namaSuper: sesi.nama,
+        status: aksi === "tolak" ? "Ditolak" : "Disetujui",
+        riwayat: [...x.riwayat, { oleh: sesi.nama, aksi: aksi === "tolak" ? "Ditolak" : "Disetujui", tgl: iso(TODAY) }],
+      };
+    }));
+    if (peran === "superadmin" && aksi === "setuju") terapkanEfek(i);
+    setLihat(null);
+  };
+
+  const ajukanKontrak = (data) => { setIzin((p) => [data, ...p]); setBukaKontrak(false); };
+
+  return (
+    <div className="space-y-4">
+      <div className="flex flex-wrap items-end justify-between gap-3">
+        <div>
+          <h1 className="text-2xl font-semibold text-slate-900">Perizinan</h1>
+          <p className="text-sm text-slate-500">
+            {peran === "user" ? "Pengajuan Anda dan statusnya" : `${antrianSaya.length} form menunggu tanda tangan Anda`}
+          </p>
+        </div>
+        <div className="flex gap-2">
+          {peran === "user" && <Tombol varian="aksi" ikon={Plus} onClick={() => setBukaForm(true)}>Ajukan izin</Tombol>}
+          {peran !== "user" && (
+            <Tombol varian="aksi" ikon={CalendarPlus} onClick={() => setBukaKontrak(true)}>Ajukan perpanjangan kontrak</Tombol>
+          )}
+        </div>
+      </div>
+
+      {peran !== "user" && antrianSaya.length > 0 && (
+        <div className="rounded border border-amber-300 bg-amber-50 p-4">
+          <p className="mb-3 text-sm font-medium text-amber-900">Menunggu tindakan Anda</p>
+          <div className="space-y-2">
+            {antrianSaya.map((i) => (
+              <button key={i.id} onClick={() => { setLihat(i); setTtdSementara(null); }}
+                className="flex w-full items-center justify-between rounded border border-amber-200 bg-white px-3 py-2 text-left hover:border-amber-500">
+                <span className="text-sm">
+                  <span className="font-medium text-slate-900">{i.nama}</span>
+                  <span className="text-slate-500"> · {i.kategori} · {tglPendek(i.tglMulai)} ({i.jumlahHari} hari)</span>
+                </span>
+                <ChevronRight size={16} className="text-slate-400" />
+              </button>
+            ))}
+          </div>
+        </div>
+      )}
+
+      <div className="overflow-x-auto rounded border border-stone-300 bg-white">
+        <table className="w-full min-w-max text-sm">
+          <thead className="bg-stone-100 text-left text-xs uppercase tracking-wide text-slate-500">
+            <tr>
+              <th className="px-4 py-2.5 font-medium">Pemohon</th><th className="px-3 font-medium">Jenis</th>
+              <th className="px-3 font-medium">Tanggal</th><th className="px-3 font-medium">Hari</th>
+              <th className="px-3 font-medium">Status</th><th className="px-3 font-medium">Tanda tangan</th>
+              <th className="px-3"></th>
+            </tr>
+          </thead>
+          <tbody>
+            {daftar.map((i) => (
+              <tr key={i.id} className="border-t border-stone-200 hover:bg-stone-50">
+                <td className="px-4 py-2.5">
+                  <p className="font-medium text-slate-900">{i.nama}</p>
+                  <p className="text-xs text-slate-500">{i.npk} · {i.departemen}</p>
+                </td>
+                <td className="px-3 text-slate-700">{i.kategori}</td>
+                <td className="px-3 text-slate-600">{tglPendek(i.tglMulai)} – {tglPendek(i.tglSelesai)}</td>
+                <td className="px-3 tabular-nums text-slate-600">{i.jumlahHari}</td>
+                <td className="px-3"><Lencana warna={lencanaStatus(i.status)}>{i.status}</Lencana></td>
+                <td className="px-3">
+                  <div className="flex gap-1">
+                    {[["P", i.ttdUser], ["A", i.ttdAdmin], ["S", i.ttdSuper]].map(([l, v]) => (
+                      <span key={l} title={{ P: "Pemohon", A: "Admin", S: "Super Admin" }[l]}
+                        className={`flex h-6 w-6 items-center justify-center rounded text-xs font-semibold ${v ? "bg-teal-800 text-white" : "bg-stone-200 text-slate-400"}`}>
+                        {l}
+                      </span>
+                    ))}
+                  </div>
+                </td>
+                <td className="px-3 text-right">
+                  <Tombol kecil varian="sunyi" onClick={() => { setLihat(i); setTtdSementara(null); }}>Buka</Tombol>
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+        {daftar.length === 0 && (
+          <div className="p-8">
+            <Kosong pesan="Belum ada pengajuan perizinan."
+              aksi={peran === "user" ? <Tombol varian="aksi" ikon={Plus} onClick={() => setBukaForm(true)}>Ajukan izin pertama</Tombol> : null} />
+          </div>
+        )}
+      </div>
+
+      <Modal open={bukaForm} onClose={() => setBukaForm(false)} title="Ajukan perizinan" lebar="max-w-2xl">
+        <FormPengajuan sesi={sesi} karyawan={karyawan} onKirim={kirimBaru} onBatal={() => setBukaForm(false)} />
+      </Modal>
+
+      <Modal open={bukaKontrak} onClose={() => setBukaKontrak(false)} title="Ajukan perpanjangan kontrak" lebar="max-w-2xl">
+        <FormPerpanjanganKontrak sesi={sesi} karyawan={karyawan} onKirim={ajukanKontrak} onBatal={() => setBukaKontrak(false)} />
+      </Modal>
+
+      <Modal open={Boolean(lihat)} onClose={() => setLihat(null)} lebar="max-w-3xl"
+        title={lihat ? `${lihat.kategori} — ${lihat.nama}` : ""}>
+        {lihat && (
+          <div className="space-y-4">
+            <div className="grid gap-4 sm:grid-cols-2">
+              <div className="space-y-1 text-sm">
+                <p><span className="text-slate-500">NPK</span> · {lihat.npk}</p>
+                <p><span className="text-slate-500">Departemen</span> · {lihat.departemen}</p>
+                <p><span className="text-slate-500">Tanggal</span> · {tglPanjang(lihat.tglMulai)} s.d. {tglPanjang(lihat.tglSelesai)}</p>
+                <p><span className="text-slate-500">Lama</span> · {lihat.jumlahHari} hari</p>
+                <p className="pt-2 text-slate-700">{lihat.alasan}</p>
+              </div>
+              <div className="rounded bg-stone-100 p-3">
+                <p className="mb-2 text-xs font-medium text-slate-600">Jejak persetujuan</p>
+                <ol className="space-y-2">
+                  {lihat.riwayat.map((r, idx) => (
+                    <li key={idx} className="flex gap-2 text-xs">
+                      <span className="mt-1 h-1.5 w-1.5 shrink-0 rounded-full bg-teal-700" />
+                      <span><span className="font-medium text-slate-800">{r.aksi}</span> oleh {r.oleh}<br />
+                        <span className="text-slate-500">{tglPanjang(r.tgl)}</span></span>
+                    </li>
+                  ))}
+                </ol>
+              </div>
+            </div>
+
+            <div className="grid grid-cols-3 gap-3 border-t border-stone-200 pt-4">
+              <TtdTersimpan nilai={lihat.ttdUser} nama={lihat.nama} peran="Pemohon" />
+              <TtdTersimpan nilai={lihat.ttdAdmin} nama={lihat.namaAdmin || ""} peran="Diperiksa HRGA" />
+              <TtdTersimpan nilai={lihat.ttdSuper} nama={lihat.namaSuper || ""} peran="Disetujui Direksi" />
+            </div>
+
+            {((peran === "admin" && lihat.status === "Menunggu Admin") ||
+              (peran === "superadmin" && lihat.status === "Menunggu Super Admin")) && (
+              <div className="border-t border-stone-200 pt-4">
+                <p className="mb-2 text-xs font-medium text-slate-600">
+                  Tanda tangan {peran === "admin" ? "Admin" : "Super Admin"} yang akan dibubuhkan
+                </p>
+                {sesi.ttd ? (
+                  <div className="flex items-center gap-3 rounded border border-stone-300 bg-white p-3">
+                    <img src={sesi.ttd} alt="Tanda tangan Anda" className="h-16 object-contain" />
+                    <span className="text-sm text-slate-600">{sesi.nama}</span>
+                  </div>
+                ) : (
+                  <p className="flex items-start gap-2 rounded bg-amber-50 px-3 py-2 text-sm text-amber-900">
+                    <AlertTriangle size={15} className="mt-0.5 shrink-0" />
+                    Belum ada tanda tangan tersimpan. Buka menu Profil saya untuk membuatnya.
+                  </p>
+                )}
+                <div className="mt-3 flex justify-end gap-2">
+                  <Tombol varian="bahaya" ikon={X} disabled={!sesi.ttd} onClick={() => proses(lihat, "tolak")}>Tolak</Tombol>
+                  <Tombol varian="utama" ikon={Check} disabled={!sesi.ttd} onClick={() => proses(lihat, "setuju")}>
+                    {peran === "admin" ? "Tanda tangani & teruskan" : "Setujui"}
+                  </Tombol>
+                </div>
+              </div>
+            )}
+
+            <div className="flex justify-between border-t border-stone-200 pt-4">
+              <Tombol varian="garis" ikon={Printer} onClick={() => setCetak(lihat)}>Pratinjau cetak A5</Tombol>
+              <Tombol varian="sunyi" onClick={() => setLihat(null)}>Tutup</Tombol>
+            </div>
+          </div>
+        )}
+      </Modal>
+
+      <Modal open={Boolean(cetak)} onClose={() => setCetak(null)} title="Pratinjau cetak — A5" lebar="max-w-2xl">
+        {cetak && (
+          <div className="space-y-3">
+            <div className="max-h-[70vh] overflow-y-auto bg-stone-200 p-4">
+              <FormA5 izin={cetak} />
+            </div>
+            <div className="flex justify-end gap-2">
+              <Tombol varian="garis" onClick={() => setCetak(null)}>Tutup</Tombol>
+              <Tombol ikon={Printer} onClick={() => window.print()}>Cetak</Tombol>
+            </div>
+          </div>
+        )}
+      </Modal>
+    </div>
+  );
+}
+
+/* ============================================================================
+   INBOX
+   ========================================================================== */
+
+function KotakMasuk({ izin, sesi, karyawan }) {
+  const saya = karyawan.find((k) => k.npk === sesi.npk);
+  const pesan = [];
+
+  izin.filter((i) => i.npk === sesi.npk).forEach((i) => {
+    pesan.push({
+      id: i.id, judul: `${i.kategori} ${tglPendek(i.tglMulai)} — ${i.status}`,
+      isi: i.status === "Disetujui" ? "Pengajuan Anda disetujui Super Admin dan sudah tercatat pada lembar absensi."
+        : i.status === "Ditolak" ? "Pengajuan Anda ditolak. Hubungi HRGA untuk penjelasan."
+        : `Sedang diproses: ${i.status}.`,
+      tgl: i.riwayat[i.riwayat.length - 1].tgl,
+      nada: i.status === "Disetujui" ? "bg-emerald-50 border-emerald-200"
+        : i.status === "Ditolak" ? "bg-red-50 border-red-200" : "bg-white border-stone-200",
+    });
+  });
+
+  if (saya?.employmentStatus === "PKWT" && saya.kontrakExpired) {
+    const sisa = sisaHariKontrak(saya.kontrakExpired);
+    if (sisa <= 60) pesan.push({
+      id: "kontrak", judul: `Kontrak Anda berakhir dalam ${sisa} hari`,
+      isi: `Masa PKWT berakhir ${tglPanjang(saya.kontrakExpired)}. HRGA akan menghubungi Anda terkait perpanjangan.`,
+      tgl: iso(TODAY), nada: "bg-amber-50 border-amber-200",
+    });
+  }
+
+  pesan.sort((a, b) => b.tgl.localeCompare(a.tgl));
+
+  return (
+    <div className="space-y-4">
+      <div>
+        <h1 className="text-2xl font-semibold text-slate-900">Kotak masuk</h1>
+        <p className="text-sm text-slate-500">Status perizinan, surat peringatan, dan pemberitahuan kontrak.</p>
+      </div>
+      {pesan.length === 0 ? (
+        <Kosong pesan="Belum ada pemberitahuan untuk Anda." />
+      ) : (
+        <div className="space-y-2">
+          {pesan.map((m) => (
+            <article key={m.id} className={`rounded border p-4 ${m.nada}`}>
+              <div className="flex items-start justify-between gap-4">
+                <h2 className="text-sm font-semibold text-slate-900">{m.judul}</h2>
+                <span className="shrink-0 text-xs text-slate-500">{tglPendek(m.tgl)}</span>
+              </div>
+              <p className="mt-1 text-sm text-slate-600">{m.isi}</p>
+            </article>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/* ============================================================================
+   CUTI, AKUN, PROFIL
+   ========================================================================== */
+
+function ManajemenCuti({ karyawan, setKaryawan }) {
+  const [cari, setCari] = useState("");
+  const daftar = karyawan.filter((k) => k.status === "Active" &&
+    (k.nama + k.npk).toLowerCase().includes(cari.toLowerCase()));
+
+  const ubah = (id, kunci, nilai) =>
+    setKaryawan((prev) => prev.map((k) => (k.id === id ? { ...k, [kunci]: Math.max(0, Number(nilai) || 0) } : k)));
+
+  return (
+    <div className="space-y-4">
+      <div className="flex flex-wrap items-end justify-between gap-3">
+        <div>
+          <h1 className="text-2xl font-semibold text-slate-900">Jatah cuti</h1>
+          <p className="text-sm text-slate-500">Sisa cuti berkurang otomatis saat pengajuan cuti disetujui Super Admin.</p>
+        </div>
+        <input value={cari} onChange={(e) => setCari(e.target.value)} placeholder="Cari nama atau NPK" className={`${inputCls} w-64`} />
+      </div>
+      <div className="overflow-x-auto rounded border border-stone-300 bg-white">
+        <table className="w-full min-w-max text-sm">
+          <thead className="bg-stone-100 text-left text-xs uppercase tracking-wide text-slate-500">
+            <tr>
+              <th className="px-4 py-2.5 font-medium">Karyawan</th><th className="px-3 font-medium">Dept</th>
+              <th className="px-3 font-medium">Jatah tahunan</th><th className="px-3 font-medium">Sisa</th>
+              <th className="px-3 font-medium">Terpakai</th>
+            </tr>
+          </thead>
+          <tbody>
+            {daftar.map((k) => (
+              <tr key={k.id} className="border-t border-stone-200">
+                <td className="px-4 py-2">
+                  <p className="font-medium text-slate-900">{k.nama}</p>
+                  <p className="text-xs tabular-nums text-slate-500">{k.npk}</p>
+                </td>
+                <td className="px-3 text-slate-600">{k.departemen}</td>
+                <td className="px-3">
+                  <input type="number" value={k.jatahCuti} onChange={(e) => ubah(k.id, "jatahCuti", e.target.value)}
+                    className={`${inputCls} w-20 py-1 tabular-nums`} />
+                </td>
+                <td className="px-3">
+                  <input type="number" value={k.sisaCuti} onChange={(e) => ubah(k.id, "sisaCuti", e.target.value)}
+                    className={`${inputCls} w-20 py-1 tabular-nums`} />
+                </td>
+                <td className="px-3 tabular-nums text-slate-600">{Math.max(0, k.jatahCuti - k.sisaCuti)} hari</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+}
+
+function ManajemenAkun({ akun, setAkun, karyawan, peran }) {
+  const [buka, setBuka] = useState(false);
+  const [f, setF] = useState({ nama: "", email: "", password: "", role: "user", npk: "" });
+
+  const simpan = () => {
+    if (!f.nama.trim() || !f.email.trim() || !f.password.trim()) return alert("Nama, email, dan kata sandi wajib diisi.");
+    if (akun.some((a) => a.email.toLowerCase() === f.email.trim().toLowerCase())) return alert("Email ini sudah dipakai akun lain.");
+    setAkun((p) => [...p, { ...f, id: uid(), npk: f.npk || null }]);
+    setBuka(false); setF({ nama: "", email: "", password: "", role: "user", npk: "" });
+  };
+
+  const hapus = (id) => setAkun((p) => p.filter((a) => a.id !== id));
+
+  return (
+    <div className="space-y-4">
+      <div className="flex flex-wrap items-end justify-between gap-3">
+        <div>
+          <h1 className="text-2xl font-semibold text-slate-900">Akun pengguna</h1>
+          <p className="text-sm text-slate-500">{akun.length} akun terdaftar</p>
+        </div>
+        <Tombol ikon={Plus} onClick={() => setBuka(true)}>Buat akun</Tombol>
+      </div>
+      <div className="overflow-x-auto rounded border border-stone-300 bg-white">
+        <table className="w-full min-w-max text-sm">
+          <thead className="bg-stone-100 text-left text-xs uppercase tracking-wide text-slate-500">
+            <tr><th className="px-4 py-2.5 font-medium">Nama</th><th className="px-3 font-medium">Email</th>
+              <th className="px-3 font-medium">Peran</th><th className="px-3 font-medium">NPK tertaut</th><th className="px-3"></th></tr>
+          </thead>
+          <tbody>
+            {akun.map((a) => (
+              <tr key={a.id} className="border-t border-stone-200">
+                <td className="px-4 py-2 font-medium text-slate-900">{a.nama}</td>
+                <td className="px-3 text-slate-600">{a.email}</td>
+                <td className="px-3">
+                  <Lencana warna={a.role === "superadmin" ? "bg-slate-900 text-white" : a.role === "admin" ? "bg-teal-100 text-teal-900" : "bg-stone-200 text-slate-700"}>
+                    {{ superadmin: "Super Admin", admin: "Admin", user: "Karyawan" }[a.role]}
+                  </Lencana>
+                </td>
+                <td className="px-3 tabular-nums text-slate-600">{a.npk || "—"}</td>
+                <td className="px-3 text-right">
+                  <Tombol kecil varian="sunyi" onClick={() => hapus(a.id)} disabled={a.role === "superadmin" && peran !== "superadmin"}>Hapus</Tombol>
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+
+      <Modal open={buka} onClose={() => setBuka(false)} title="Buat akun baru" lebar="max-w-xl">
+        <div className="space-y-4">
+          <div className="grid gap-4 sm:grid-cols-2">
+            <Field label="Nama" wajib><input value={f.nama} onChange={(e) => setF({ ...f, nama: e.target.value })} className={inputCls} /></Field>
+            <Field label="Email" wajib><input value={f.email} onChange={(e) => setF({ ...f, email: e.target.value })} className={inputCls} placeholder="nama@ssmi.com" /></Field>
+            <Field label="Kata sandi" wajib><input value={f.password} onChange={(e) => setF({ ...f, password: e.target.value })} className={inputCls} /></Field>
+            <Field label="Peran">
+              <select value={f.role} onChange={(e) => setF({ ...f, role: e.target.value })} className={inputCls}>
+                <option value="user">Karyawan</option>
+                <option value="admin">Admin</option>
+                {peran === "superadmin" && <option value="superadmin">Super Admin</option>}
+              </select>
+            </Field>
+            <Field label="Tautkan ke karyawan" hint="Agar absensi dan perizinan terhubung">
+              <select value={f.npk} onChange={(e) => setF({ ...f, npk: e.target.value })} className={inputCls}>
+                <option value="">Tidak ditautkan</option>
+                {karyawan.filter((k) => k.status === "Active").map((k) => (
+                  <option key={k.id} value={k.npk}>{k.npk} — {k.nama}</option>
+                ))}
+              </select>
+            </Field>
+          </div>
+          <div className="flex justify-end gap-2 border-t border-stone-200 pt-4">
+            <Tombol varian="garis" onClick={() => setBuka(false)}>Batal</Tombol>
+            <Tombol onClick={simpan} ikon={Check}>Simpan akun</Tombol>
+          </div>
+        </div>
+      </Modal>
+    </div>
+  );
+}
+
+function ProfilSaya({ sesi, karyawan, setKaryawan, onSimpanTtd }) {
+  const saya = karyawan.find((k) => k.npk === sesi.npk);
+  const [f, setF] = useState(saya || null);
+  const [tersimpan, setTersimpan] = useState(false);
+
+  useEffect(() => { if (saya && (!f || f.id !== saya.id)) setF(saya); }, [saya?.id]); // eslint-disable-line
+
+  if (!saya || !f) {
+    return (
+      <div className="space-y-4">
+        <div>
+          <h1 className="text-2xl font-semibold text-slate-900">Profil saya</h1>
+          <p className="text-sm text-slate-500">Akun {sesi.nama} · {{ superadmin: "Super Admin", admin: "Admin", user: "Karyawan" }[sesi.role]}</p>
+        </div>
+        <div className="grid gap-4 lg:grid-cols-2">
+          <Panel judul="Akun">
+            <dl className="space-y-2 text-sm">
+              {[["Nama", sesi.nama], ["Email", sesi.email], ["NPK tertaut", sesi.npk || "Tidak ditautkan"]].map(([l, v]) => (
+                <div key={l} className="flex justify-between gap-4 border-b border-stone-100 pb-1.5">
+                  <dt className="text-slate-500">{l}</dt><dd className="font-medium text-slate-800">{v}</dd>
+                </div>
+              ))}
+            </dl>
+          </Panel>
+          <KartuTandaTangan sesi={sesi} onSimpan={onSimpanTtd} />
+        </div>
+      </div>
+    );
+  }
+
+  const set = (k) => (e) => { setF({ ...f, [k]: e.target.value }); setTersimpan(false); };
+  const unggah = (e) => {
+    const file = e.target.files?.[0]; if (!file) return;
+    const r = new FileReader(); r.onload = () => setF((p) => ({ ...p, foto: r.result })); r.readAsDataURL(file);
+  };
+  const simpan = () => { setKaryawan((prev) => prev.map((k) => (k.id === f.id ? f : k))); setTersimpan(true); };
+
+  const sisa = f.employmentStatus === "PKWT" ? sisaHariKontrak(f.kontrakExpired) : null;
+
+  return (
+    <div className="space-y-4">
+      <div>
+        <h1 className="text-2xl font-semibold text-slate-900">Profil saya</h1>
+        <p className="text-sm text-slate-500">Perbarui data kontak dan foto. Data kepegawaian dikelola HRGA.</p>
+      </div>
+
+      <div className="grid gap-4 lg:grid-cols-3">
+        <Panel judul="Identitas" className="lg:col-span-2">
+          <div className="mb-4 flex items-center gap-4">
+            <Avatar nama={f.nama} foto={f.foto} size={72} />
+            <label className="cursor-pointer text-sm font-medium text-teal-800 hover:underline">
+              Ganti foto
+              <input type="file" accept="image/*" onChange={unggah} className="hidden" />
+            </label>
+          </div>
+          <div className="grid gap-4 sm:grid-cols-2">
+            <Field label="Nama lengkap"><input value={f.nama} disabled className={inputCls} /></Field>
+            <Field label="NPK"><input value={f.npk} disabled className={inputCls} /></Field>
+            <Field label="Tempat, tanggal lahir">
+              <input disabled className={inputCls} value={`${f.tempatLahir}, ${tglPendek(f.tanggalLahir)}`} />
+            </Field>
+            <Field label="Usia"><input disabled className={inputCls} value={`${hitungUsia(f.tanggalLahir)} tahun`} /></Field>
+            <Field label="No. telepon"><input value={f.noTelepon} onChange={set("noTelepon")} className={inputCls} /></Field>
+            <Field label="No. telepon darurat"><input value={f.noTeleponDarurat} onChange={set("noTeleponDarurat")} className={inputCls} /></Field>
+            <Field label="No. BPJS Ketenagakerjaan"><input value={f.noBpjsTk} onChange={set("noBpjsTk")} className={inputCls} /></Field>
+            <Field label="No. BPJS Kesehatan"><input value={f.noBpjsKes} onChange={set("noBpjsKes")} className={inputCls} /></Field>
+            <Field label="Status perkawinan">
+              <select value={f.statusKawin} onChange={set("statusKawin")} className={inputCls}>
+                {KAWIN.map((k) => <option key={k}>{k}</option>)}
+              </select>
+            </Field>
+            <Field label="Pendidikan terakhir">
+              <select value={f.pendidikan} onChange={set("pendidikan")} className={inputCls}>
+                {PENDIDIKAN.map((p) => <option key={p}>{p}</option>)}
+              </select>
+            </Field>
+            <div className="sm:col-span-2">
+              <Field label="Alamat domisili">
+                <textarea rows={2} value={f.alamat || ""} onChange={set("alamat")} className={inputCls}
+                  placeholder="Alamat tempat tinggal saat ini" />
+              </Field>
+            </div>
+          </div>
+          <div className="mt-4 flex items-center gap-3 border-t border-stone-200 pt-4">
+            <Tombol onClick={simpan} ikon={Check}>Simpan perubahan</Tombol>
+            {tersimpan && <span className="text-sm text-emerald-700">Perubahan tersimpan.</span>}
+          </div>
+        </Panel>
+
+        <div className="space-y-4">
+          <KartuTandaTangan sesi={sesi} onSimpan={onSimpanTtd} />
+          <Panel judul="Kepegawaian">
+            <dl className="space-y-2 text-sm">
+              {[["Departemen", f.departemen], ["Section", f.section || "—"], ["Level", f.level],
+                ["Employment status", f.employmentStatus], ["Source contract", f.sourceContract],
+                ["Tanggal masuk", tglPanjang(f.tanggalMasuk)]].map(([l, v]) => (
+                <div key={l} className="flex justify-between gap-4 border-b border-stone-100 pb-1.5">
+                  <dt className="text-slate-500">{l}</dt><dd className="text-right font-medium text-slate-800">{v}</dd>
+                </div>
+              ))}
+            </dl>
+          </Panel>
+          {sisa != null && (
+            <Panel judul="Sisa kontrak">
+              <p className="text-4xl font-semibold tabular-nums text-slate-900">{sisa}<span className="ml-1 text-base font-normal text-slate-500">hari</span></p>
+              <p className="mt-1 text-sm text-slate-500">Berakhir {tglPanjang(f.kontrakExpired)}</p>
+            </Panel>
+          )}
+          <Panel judul="Cuti tahunan">
+            <p className="text-4xl font-semibold tabular-nums text-slate-900">{f.sisaCuti}<span className="ml-1 text-base font-normal text-slate-500">/ {f.jatahCuti} hari</span></p>
+            <div className="mt-3 h-2 w-full overflow-hidden rounded bg-stone-200">
+              <div className="h-full bg-teal-700" style={{ width: `${(f.sisaCuti / (f.jatahCuti || 1)) * 100}%` }} />
+            </div>
+          </Panel>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ============================================================================
+   KERANGKA APLIKASI
+   ========================================================================== */
+
+const MENU = [
+  { kunci: "dashboard", label: "Dashboard", ikon: LayoutDashboard, peran: ["admin", "superadmin"] },
+  { kunci: "karyawan", label: "Database karyawan", ikon: Users, peran: ["admin", "superadmin"] },
+  { kunci: "nonaktif", label: "Karyawan nonaktif", ikon: UserMinus, peran: ["admin", "superadmin"] },
+  { kunci: "absensi", label: "Absensi", ikon: CalendarCheck, peran: ["admin", "superadmin", "user"] },
+  { kunci: "perizinan", label: "Perizinan", ikon: FileSignature, peran: ["admin", "superadmin", "user"] },
+  { kunci: "cuti", label: "Jatah cuti", ikon: CalendarClock, peran: ["admin", "superadmin"] },
+  { kunci: "inbox", label: "Kotak masuk", ikon: InboxIcon, peran: ["user"] },
+  { kunci: "profil", label: "Profil saya", ikon: UserCog, peran: ["admin", "superadmin", "user"] },
+  { kunci: "akun", label: "Akun pengguna", ikon: Shield, peran: ["admin", "superadmin"] },
+];
+
+export default function HRIS() {
+  const [akun, setAkun] = useState(AKUN_AWAL);
+  const [idSesi, setIdSesi] = useState(null);
+  const [karyawan, setKaryawan] = useState(karyawanAwal);
+  const [izin, setIzin] = useState(() => IZIN_AWAL(karyawanAwal));
+  const [absensi, setAbsensi] = useState(() => absensiAwal(karyawanAwal));
+  const [geofence, setGeofence] = useState(GEOFENCE_AWAL);
+  const [halaman, setHalaman] = useState("dashboard");
+  const [cari, setCari] = useState("");
+  const [memuat, setMemuat] = useState(true);
+  const [statusSimpan, setStatusSimpan] = useState("siap"); // siap | menyimpan | gagal
+  const siapSimpan = useRef(false);
+
+  /* Muat data tersimpan sekali saat aplikasi dibuka. */
+  useEffect(() => {
+    let batal = false;
+    (async () => {
+      const db = await muatDB();
+      if (!batal && db) {
+        setAkun(db.akun || AKUN_AWAL);
+        setKaryawan(db.karyawan || karyawanAwal);
+        setIzin(db.izin || []);
+        setAbsensi(db.absensi || {});
+        setGeofence(db.geofence || GEOFENCE_AWAL);
+      }
+      if (!batal) { setMemuat(false); siapSimpan.current = true; }
+    })();
+    return () => { batal = true; };
+  }, []);
+
+  /* Tulis balik setiap kali data berubah. */
+  useEffect(() => {
+    if (!siapSimpan.current) return;
+    setStatusSimpan("menyimpan");
+    const jeda = setTimeout(async () => {
+      try {
+        await simpanDB({ akun, karyawan, izin, absensi, geofence });
+        setStatusSimpan("siap");
+      } catch {
+        setStatusSimpan("gagal");
+      }
+    }, 400);
+    return () => clearTimeout(jeda);
+  }, [akun, karyawan, izin, absensi, geofence]);
+
+  const sesi = akun.find((a) => a.id === idSesi) || null;
+
+  const masuk = (a) => {
+    setIdSesi(a.id);
+    setHalaman(a.role === "user" ? "absensi" : "dashboard");
+  };
+
+  const keluar = () => { setIdSesi(null); setCari(""); };
+
+  const simpanTtd = (ttd) => setAkun((prev) => prev.map((a) => (a.id === idSesi ? { ...a, ttd } : a)));
+
+  const aturUlang = async () => {
+    if (!confirm("Hapus seluruh data tersimpan dan kembali ke data awal? Tindakan ini tidak bisa dibatalkan.")) return;
+    siapSimpan.current = false;
+    await hapusDB();
+    const ulang = karyawanAwal;
+    setAkun(AKUN_AWAL); setKaryawan(ulang); setIzin(IZIN_AWAL(ulang));
+    setAbsensi(absensiAwal(ulang)); setGeofence(GEOFENCE_AWAL); setIdSesi(null);
+    setTimeout(() => { siapSimpan.current = true; }, 600);
+  };
+
+  if (memuat) {
+    return (
+      <div className="flex min-h-screen items-center justify-center bg-slate-900 text-slate-300">
+        <div className="flex items-center gap-3 text-sm">
+          <Loader2 size={18} className="animate-spin" /> Memuat data HRIS…
+        </div>
+      </div>
+    );
+  }
+
+  if (!sesi) return (<><GayaCetak /><Login akun={akun} onMasuk={masuk} /></>);
+
+  const menu = MENU.filter((m) => m.peran.includes(sesi.role));
+  const labelPeran = { superadmin: "Super Admin", admin: "Admin", user: "Karyawan" }[sesi.role];
+  const antrian = izin.filter((i) =>
+    (sesi.role === "admin" && i.status === "Menunggu Admin") ||
+    (sesi.role === "superadmin" && i.status === "Menunggu Super Admin")
+  ).length;
+
+  const cariKaryawan = (nilai) => {
+    setCari(nilai);
+    if (nilai && sesi.role !== "user" && halaman !== "karyawan") setHalaman("karyawan");
+  };
+
+  return (
+    <div className="flex min-h-screen bg-stone-100 text-slate-900">
+      <GayaCetak />
+      {/* Sidebar */}
+      <aside className="tanpa-cetak hidden w-60 shrink-0 flex-col bg-slate-900 lg:flex">
+        <div className="flex items-center gap-2.5 px-5 py-5">
+          <div className="flex h-8 w-8 items-center justify-center bg-amber-400 text-sm font-bold text-slate-900">S</div>
+          <div className="leading-tight">
+            <p className="text-sm font-semibold text-white">HRIS SSMI</p>
+            <p className="text-xs text-slate-400">Internal</p>
+          </div>
+        </div>
+        <nav className="flex-1 space-y-0.5 px-3">
+          {menu.map((m) => {
+            const aktif = halaman === m.kunci;
+            return (
+              <button key={m.kunci} onClick={() => setHalaman(m.kunci)}
+                className={`flex w-full items-center gap-3 rounded px-3 py-2 text-sm transition-colors focus:outline-none focus:ring-2 focus:ring-amber-400 ${
+                  aktif ? "bg-teal-800 font-medium text-white" : "text-slate-300 hover:bg-slate-800 hover:text-white"}`}>
+                <m.ikon size={16} className="shrink-0" />
+                <span className="flex-1 text-left">{m.label}</span>
+                {m.kunci === "perizinan" && antrian > 0 && (
+                  <span className="rounded bg-amber-400 px-1.5 text-xs font-semibold tabular-nums text-slate-900">{antrian}</span>
+                )}
+              </button>
+            );
+          })}
+        </nav>
+        <div className="border-t border-slate-800 p-3">
+          <div className="flex items-center gap-3 px-2 py-2">
+            <Avatar nama={sesi.nama} size={34} />
+            <div className="min-w-0 leading-tight">
+              <p className="truncate text-sm font-medium text-white">{sesi.nama}</p>
+              <p className="text-xs text-slate-400">{labelPeran}</p>
+            </div>
+          </div>
+          <div className="flex items-center gap-2 px-3 py-1.5 text-xs text-slate-500">
+            {statusSimpan === "menyimpan" ? (<><CloudUpload size={13} className="animate-pulse" /> Menyimpan…</>)
+              : statusSimpan === "gagal" ? (<><AlertTriangle size={13} className="text-amber-400" /> Gagal menyimpan</>)
+              : (<><Check size={13} className="text-emerald-500" /> Tersimpan</>)}
+          </div>
+          <button onClick={keluar} className="mt-1 flex w-full items-center gap-3 rounded px-3 py-2 text-sm text-slate-400 hover:bg-slate-800 hover:text-white">
+            <LogOut size={16} /> Keluar
+          </button>
+          {sesi.role === "superadmin" && (
+            <button onClick={aturUlang} className="flex w-full items-center gap-3 rounded px-3 py-2 text-sm text-slate-500 hover:bg-slate-800 hover:text-red-300">
+              <RotateCcw size={16} /> Atur ulang data
+            </button>
+          )}
+        </div>
+      </aside>
+
+      {/* Area kerja */}
+      <div className="flex min-w-0 flex-1 flex-col">
+        <header className="tanpa-cetak flex items-center gap-3 border-b border-stone-300 bg-white px-4 py-3 lg:px-6">
+          <div className="relative flex-1 max-w-md">
+            <Search size={15} className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" />
+            <input value={cari} onChange={(e) => cariKaryawan(e.target.value)}
+              placeholder={sesi.role === "user" ? "Cari menu atau data Anda" : "Cari karyawan: nama, NPK, departemen"}
+              className={`${inputCls} pl-9`} />
+          </div>
+          <div className="hidden items-center gap-2 text-xs text-slate-500 sm:flex">
+            <MapPin size={14} /> {geofence.nama}
+          </div>
+          <button onClick={keluar} className="rounded p-2 text-slate-500 hover:bg-stone-100 lg:hidden" aria-label="Keluar">
+            <LogOut size={18} />
+          </button>
+        </header>
+
+        {/* Navigasi bawah untuk layar kecil */}
+        <nav className="tanpa-cetak flex gap-1 overflow-x-auto border-b border-stone-300 bg-white px-2 py-1.5 lg:hidden">
+          {menu.map((m) => (
+            <button key={m.kunci} onClick={() => setHalaman(m.kunci)}
+              className={`flex shrink-0 items-center gap-1.5 rounded px-3 py-1.5 text-xs ${
+                halaman === m.kunci ? "bg-teal-800 text-white" : "text-slate-600"}`}>
+              <m.ikon size={14} /> {m.label}
+            </button>
+          ))}
+        </nav>
+
+        <main className="flex-1 p-4 lg:p-6">
+          {halaman === "dashboard" && sesi.role !== "user" && <Dashboard karyawan={karyawan} />}
+          {halaman === "karyawan" && sesi.role !== "user" && (
+            <DatabaseKaryawan karyawan={karyawan} setKaryawan={setKaryawan} peran={sesi.role} cari={cari} setCari={setCari} />
+          )}
+          {halaman === "nonaktif" && sesi.role !== "user" && <KaryawanNonaktif karyawan={karyawan} />}
+          {halaman === "absensi" && (
+            <Absensi karyawan={karyawan} absensi={absensi} setAbsensi={setAbsensi}
+              geofence={geofence} setGeofence={setGeofence} peran={sesi.role} sesi={sesi} />
+          )}
+          {halaman === "perizinan" && (
+            <Perizinan izin={izin} setIzin={setIzin} sesi={sesi} karyawan={karyawan}
+              setKaryawan={setKaryawan} setAbsensi={setAbsensi} />
+          )}
+          {halaman === "cuti" && sesi.role !== "user" && <ManajemenCuti karyawan={karyawan} setKaryawan={setKaryawan} />}
+          {halaman === "inbox" && <KotakMasuk izin={izin} sesi={sesi} karyawan={karyawan} />}
+          {halaman === "profil" && (
+            <ProfilSaya sesi={sesi} karyawan={karyawan} setKaryawan={setKaryawan} onSimpanTtd={simpanTtd} />
+          )}
+          {halaman === "akun" && sesi.role !== "user" && (
+            <ManajemenAkun akun={akun} setAkun={setAkun} karyawan={karyawan} peran={sesi.role} />
+          )}
+        </main>
+      </div>
+    </div>
+  );
+}
